@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Gateway 极简流式控制台</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Vue 3 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <!-- marked.js：Markdown 解析 -->
+    <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+    <!-- highlight.js：代码块语法高亮 -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/highlight.min.js"></script>
+
+    <style>
+        /* ── Markdown 渲染区域样式 ── */
+        .md-body p            { margin-bottom: 0.6em; line-height: 1.7; }
+        .md-body p:last-child { margin-bottom: 0; }
+        .md-body h1,.md-body h2,.md-body h3 { font-weight: 700; margin: 0.8em 0 0.4em; }
+        .md-body h1 { font-size: 1.2em; }
+        .md-body h2 { font-size: 1.1em; }
+        .md-body h3 { font-size: 1em; }
+        .md-body ul,.md-body ol { padding-left: 1.4em; margin-bottom: 0.6em; }
+        .md-body li  { margin-bottom: 0.25em; }
+        .md-body code:not(pre code) {
+            background: #f1f5f9;
+            color: #be185d;
+            padding: 0.15em 0.4em;
+            border-radius: 4px;
+            font-size: 0.85em;
+            font-family: ui-monospace, monospace;
+        }
+        .md-body pre {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 1em;
+            overflow-x: auto;
+            margin: 0.6em 0;
+        }
+        .md-body pre code {
+            background: none;
+            color: inherit;
+            padding: 0;
+            font-size: 0.85em;
+            font-family: ui-monospace, monospace;
+        }
+        .md-body blockquote {
+            border-left: 3px solid #cbd5e1;
+            padding-left: 0.8em;
+            color: #64748b;
+            margin: 0.5em 0;
+        }
+        .md-body table { border-collapse: collapse; width: 100%; margin: 0.6em 0; font-size: 0.85em; }
+        .md-body th,.md-body td { border: 1px solid #e2e8f0; padding: 0.4em 0.6em; }
+        .md-body th { background: #f8fafc; font-weight: 600; }
+        .md-body a { color: #4f46e5; text-decoration: underline; }
+        .md-body strong { font-weight: 700; }
+        .md-body em { font-style: italic; }
+
+        /* ── 用户气泡中的 Markdown（浅色字） ── */
+        .md-body-user code:not(pre code) { background: rgba(255,255,255,0.2); color: #fff; }
+        .md-body-user pre { background: rgba(0,0,0,0.2); border-color: rgba(255,255,255,0.2); }
+        .md-body-user pre code { color: #f1f5f9; }
+        .md-body-user blockquote { border-color: rgba(255,255,255,0.4); color: #c7d2fe; }
+        .md-body-user a { color: #c7d2fe; }
+
+        /* ── 自动高度 textarea ── */
+        .auto-textarea {
+            resize: none;
+            overflow-y: hidden;
+            min-height: 44px;
+            max-height: 180px;
+            overflow-y: auto;
+        }
+        /* ── Heroicons 作为内联 SVG 同样继承 currentColor ── */
+        .icon-inline { display: inline-block; vertical-align: middle; }
+    </style>
+</head>
+<body class="bg-slate-50 h-screen flex flex-col">
+
+    <div id="app" class="flex flex-col h-full max-w-4xl mx-auto w-full p-4">
+
+        <!-- ── 头部 ── -->
+        <header class="bg-white shadow-sm border border-slate-200 rounded-2xl p-4 mb-4 flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+                <svg class="w-7 h-7 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M15.59 14.37a6 6 0 0 1-5.84 7.38v-4.8m5.84-2.58a14.98 14.98 0 0 0 6.16-12.12A14.98 14.98 0 0 0 9.631 8.41m5.96 5.96a14.926 14.926 0 0 1-5.841 2.58m-.119-8.54a6 6 0 0 0-7.381 5.84h4.8m2.581-5.84a14.927 14.927 0 0 0-2.58 5.84m2.699 2.7c-.103.021-.207.041-.311.06a15.09 15.09 0 0 1-2.448-2.448 14.9 14.9 0 0 1 .06-.312m-2.24 2.39a4.493 4.493 0 0 0-1.757 4.306 4.493 4.493 0 0 0 4.306-1.758M16.5 9a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0Z" />
+                </svg>
+                <div>
+                    <h1 class="font-bold text-slate-800 text-lg">LLM Gateway</h1>
+                    <p class="text-xs text-slate-400">基于 Spring WebFlux + Netty 的极速透传通道</p>
+                </div>
+            </div>
+            <div class="flex items-center space-x-2">
+                <!-- 清空对话按钮 -->
+                <button v-if="messages.length > 0 && !isGenerating"
+                        @click="clearMessages"
+                        class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-500 hover:bg-slate-200 transition-colors cursor-pointer">
+                    <svg class="w-3.5 h-3.5 mr-1" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" />
+                    </svg>
+                    清空对话
+                </button>
+                <!-- 真实健康状态 -->
+                <span :class="['inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium',
+                               healthStatus === 'ok'      ? 'bg-green-100 text-green-700' :
+                               healthStatus === 'error'   ? 'bg-red-100 text-red-700'     :
+                                                            'bg-slate-100 text-slate-500']">
+                    <template v-if="healthStatus === 'ok'">
+                        <svg class="w-3.5 h-3.5 mr-1" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 12.75 6 6 9-13.5" /></svg>
+                        后端正常
+                    </template>
+                    <template v-else-if="healthStatus === 'error'">
+                        <svg class="w-3.5 h-3.5 mr-1" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+                        后端不可达
+                    </template>
+                    <template v-else>
+                        <svg class="w-3.5 h-3.5 mr-1 animate-spin" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" /></svg>
+                        检查中…
+                    </template>
+                </span>
+            </div>
+        </header>
+
+        <!-- ── System Prompt 折叠面板 ── -->
+        <div class="bg-white shadow-sm border border-slate-200 rounded-2xl mb-4 overflow-hidden">
+            <button @click="systemPromptOpen = !systemPromptOpen"
+                    class="w-full flex items-center justify-between px-4 py-2.5 text-xs font-medium text-slate-500 hover:bg-slate-50 transition-colors">
+                <span class="flex items-center space-x-1.5">
+                    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28Z" />
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+                    </svg>
+                    <span>System Prompt</span>
+                    <span v-if="systemPrompt.trim()" class="bg-indigo-100 text-indigo-600 px-1.5 py-0.5 rounded text-[10px]">已设置</span>
+                </span>
+                <svg v-if="systemPromptOpen" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" /></svg>
+                <svg v-else class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m8.25 4.5 7.5 7.5-7.5 7.5" /></svg>
+            </button>
+            <div v-show="systemPromptOpen" class="px-4 pb-3">
+                <textarea v-model="systemPrompt"
+                          rows="3"
+                          placeholder="例如：你是一个专业的 Java 面试官，请用简洁专业的语言回答问题。（留空则不注入）"
+                          class="w-full border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-400 resize-none leading-relaxed">
+                </textarea>
+                <p class="text-[10px] text-slate-400 mt-1">每次发送时作为第一条 system 消息注入，不显示在对话气泡中。</p>
+            </div>
+        </div>
+
+        <!-- ── 聊天记录区 ── -->
+        <main class="flex-1 bg-white shadow-sm border border-slate-200 rounded-2xl p-6 overflow-y-auto mb-4 space-y-4">
+            <div v-if="messages.length === 0" class="h-full flex flex-col items-center justify-center text-slate-400 space-y-2">
+                <svg class="w-12 h-12 text-slate-300" fill="none" viewBox="0 0 24 24" stroke-width="1" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M20.25 8.511c.884.284 1.5 1.128 1.5 2.097v4.286c0 1.136-.847 2.1-1.98 2.193-.34.027-.68.052-1.02.072v3.091l-3-3c-1.354 0-2.694-.055-4.02-.163a2.115 2.115 0 0 1-.825-.242m9.345-8.334a2.126 2.126 0 0 0-.476-.095 48.64 48.64 0 0 0-8.048 0c-1.131.094-1.976 1.057-1.976 2.192v4.286c0 .837.46 1.58 1.155 1.951m9.345-8.334V6.637c0-1.621-1.152-3.026-2.76-3.235A48.455 48.455 0 0 0 11.25 3c-2.115 0-4.198.137-6.24.402-1.608.209-2.76 1.614-2.76 3.235v6.226c0 1.621 1.152 3.026 2.76 3.235.577.075 1.157.14 1.74.194V21l4.155-4.155" />
+                </svg>
+                <p class="text-sm">暂无对话记录，在下方输入内容，开始流式对话体验！</p>
+                <p class="text-xs text-slate-300">（流式透传 DeepSeek + 语义缓存，命中缓存时显示 ⚡ 徽章）</p>
+            </div>
+
+            <div v-for="(msg, index) in messages" :key="index"
+                 :class="['flex', msg.role === 'user' ? 'justify-end' : 'justify-start']">
+
+                <div :class="['max-w-[75%] rounded-2xl px-4 py-3 shadow-sm text-sm relative',
+                             msg.role === 'user'
+                                 ? 'bg-indigo-600 text-white rounded-br-none'
+                                 : 'bg-slate-100 text-slate-800 rounded-bl-none']">
+
+                    <!-- 缓存命中徽章 -->
+                    <span v-if="msg.isCache"
+                          class="absolute -top-2.5 -left-1 bg-yellow-400 text-yellow-900 text-[10px] font-bold px-1.5 py-0.5 rounded-md shadow-sm flex items-center space-x-0.5">
+                        <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="m11.67.1-.57.07c-1.62.38-2.86 1.44-3.52 2.95-.44 1-.53 1.96-.28 2.95-.27-.07-.55-.12-.83-.17C3.69 5.46 2.09 5.9.95 7.09c-.72.75-1.11 1.7-1.18 2.81-.04.67.06 1.38.3 2.13.53 1.64 1.41 2.62 2.67 3.41.35.22.72.4 1.1.55-.74.85-1.06 1.84-.88 3.01.23 1.49 1.04 2.54 2.36 3.27 1.85 1.02 4.07 1.2 6.24.86 2.15-.33 4.03-1.35 5.35-2.97.99-1.21 1.51-2.6 1.55-4.16.03-1.45-.39-2.75-1.29-3.97.35-.08.67-.2.97-.35 2.07-1.02 3.28-2.73 3.7-5.08.13-.73.11-1.44-.06-2.13-.37-1.54-1.22-2.62-2.55-3.33C22.01 2.22 20.4 1.8 18.7 1.7c-1.11-.07-2.07.07-2.93.38l-.45.15c.02-.22.03-.44.03-.66C15.35.63 14.6 0 13.6 0c-.73 0-1.37.39-1.93 1.01v-.01l.01.08Z"/></svg>
+                        <span>CACHED</span>
+                    </span>
+
+                    <!-- 思考模型推理过程（可折叠） -->
+                    <div v-if="msg.reasoning" class="text-xs border-l-2 border-slate-300 pl-2 mb-2"
+                         :class="msg.role === 'user' ? 'border-indigo-400' : 'border-slate-300'">
+                        <div @click="msg.reasoningOpen = !msg.reasoningOpen"
+                             class="cursor-pointer select-none text-slate-400 mb-0.5 flex items-center space-x-1">
+                            <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M12 18v-5.25m0 0a6.01 6.01 0 0 0 1.5-.189m-1.5.189a6.01 6.01 0 0 1-1.5-.189m3.75 7.478a12.06 12.06 0 0 1-4.5 0m3.75 2.383a14.406 14.406 0 0 1-3 0M14.25 18v-.192c0-.983.658-1.823 1.508-2.316a7.5 7.5 0 1 0-7.517 0c.85.493 1.509 1.333 1.509 2.316V18" />
+                            </svg>
+                            <span>推理过程</span>
+                            <svg v-if="msg.reasoningOpen" class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 15.75 7.5-7.5 7.5 7.5" /></svg>
+                            <svg v-else class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m8.25 4.5 7.5 7.5-7.5 7.5" /></svg>
+                        </div>
+                        <div v-show="msg.reasoningOpen"
+                             class="text-slate-400 italic whitespace-pre-wrap leading-relaxed">{{ msg.reasoning }}</div>
+                    </div>
+
+                    <!-- ★ 正文：Markdown 渲染 -->
+                    <div v-if="msg.content"
+                         :class="['md-body leading-relaxed', msg.role === 'user' ? 'md-body-user' : '']"
+                         v-html="renderMarkdown(msg.content)">
+                    </div>
+                    <!-- 流式生成时的光标 -->
+                    <span v-if="msg.streaming" class="inline-block w-1.5 h-3.5 bg-current animate-pulse ml-0.5 align-middle"></span>
+
+                    <!-- 角色标签 -->
+                    <div class="text-[10px] mt-1 text-right"
+                         :class="msg.role === 'user' ? 'text-indigo-200' : 'text-slate-400'">
+                        {{ msg.role === 'user' ? '用户' : 'AI Gateway' }}
+                    </div>
+                </div>
+            </div>
+
+            <!-- 滚动锚点 -->
+            <div ref="messagesEnd"></div>
+        </main>
+
+        <!-- ── 输入控制区 ── -->
+        <footer class="bg-white shadow-sm border border-slate-200 rounded-2xl p-4">
+            <div class="flex items-end space-x-3">
+
+                <textarea
+                    v-model="inputText"
+                    ref="inputRef"
+                    @keydown="handleKeydown"
+                    @input="autoResize"
+                    :disabled="isGenerating"
+                    rows="1"
+                    placeholder="输入 Prompt...（Enter 发送，Shift+Enter 换行）"
+                    class="auto-textarea flex-1 border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 rounded-xl px-4 py-3 text-sm text-slate-700 disabled:bg-slate-50 disabled:cursor-not-allowed leading-relaxed">
+                </textarea>
+
+                <button v-if="!isGenerating"
+                        @click="sendMessage"
+                        class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-xl px-6 py-3 text-sm transition-colors duration-200 shadow-sm flex items-center space-x-1.5 shrink-0">
+                    <span>发送</span>
+                    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M6 12 3.269 3.125A59.769 59.769 0 0 1 21.485 12 59.768 59.768 0 0 1 3.27 20.875L5.999 12Zm0 0h7.5" />
+                    </svg>
+                </button>
+
+                <button v-else
+                        @click="stopGenerating"
+                        class="bg-red-500 hover:bg-red-600 text-white font-medium rounded-xl px-6 py-3 text-sm transition-colors duration-200 shadow-sm flex items-center space-x-1.5 shrink-0">
+                    <span>停止</span>
+                    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M9 9.563C9 9.252 9.252 9 9.563 9h4.874c.311 0 .563.252.563.563v4.874c0 .311-.252.563-.563.563H9.564A.562.562 0 0 1 9 14.437V9.564Z" />
+                    </svg>
+                </button>
+            </div>
+        </footer>
+    </div>
+
+    <script>
+        const { createApp, ref, nextTick } = Vue;
+
+        // ── 配置 marked + highlight.js ──
+        marked.setOptions({
+            highlight: function(code, lang) {
+                if (lang && hljs.getLanguage(lang)) {
+                    return hljs.highlight(code, { language: lang }).value;
+                }
+                return hljs.highlightAuto(code).value;
+            },
+            breaks: true,
+            gfm: true,
+        });
+
+        createApp({
+            setup() {
+                const inputText       = ref('');
+                const messages        = ref([]);
+                const isGenerating    = ref(false);
+                const messagesEnd     = ref(null);
+                const inputRef        = ref(null);
+                const systemPrompt    = ref('');
+                const systemPromptOpen = ref(false);
+                const healthStatus    = ref('checking');
+                let   abortController = null;
+
+                // ── 健康检查 ──
+                const checkHealth = async () => {
+                    try {
+                        const res = await fetch('/v1/health', { signal: AbortSignal.timeout(3000) });
+                        healthStatus.value = res.ok ? 'ok' : 'error';
+                    } catch (_) {
+                        healthStatus.value = 'error';
+                    }
+                };
+                checkHealth();
+                setInterval(checkHealth, 30000);
+
+                const renderMarkdown = (text) => {
+                    if (!text) return '';
+                    try { return marked.parse(text); } catch (_) { return text; }
+                };
+
+                const autoResize = () => {
+                    const el = inputRef.value;
+                    if (!el) return;
+                    el.style.height = 'auto';
+                    el.style.height = Math.min(el.scrollHeight, 180) + 'px';
+                };
+
+                const handleKeydown = (e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        sendMessage();
+                    }
+                };
+
+                const scrollToBottom = () => {
+                    nextTick(() => {
+                        if (messagesEnd.value) messagesEnd.value.scrollIntoView({ behavior: 'smooth' });
+                    });
+                };
+
+                const clearMessages = () => { messages.value = []; };
+
+                const sendMessage = async () => {
+                    if (!inputText.value.trim() || isGenerating.value) return;
+
+                    const query = inputText.value;
+                    inputText.value = '';
+                    nextTick(() => { if (inputRef.value) inputRef.value.style.height = 'auto'; });
+
+                    messages.value.push({ role: 'user', content: query });
+                    scrollToBottom();
+
+                    const assistantMsg = { role: 'assistant', content: '', reasoning: '', reasoningOpen: true, isCache: false, streaming: true };
+                    const aiIndex = messages.value.push(assistantMsg) - 1;
+
+                    isGenerating.value = true;
+                    abortController = new AbortController();
+
+                    try {
+                        const response = await fetch('/v1/chat/completions', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                model: 'deepseek-v4-flash',
+                                messages: [
+                                    ...(systemPrompt.value.trim()
+                                        ? [{ role: 'system', content: systemPrompt.value.trim() }]
+                                        : []),
+                                    ...messages.value.slice(0, -1).map(m => ({ role: m.role, content: m.content })),
+                                ],
+                                stream: true
+                            }),
+                            signal: abortController.signal
+                        });
+
+                        if (!response.ok) {
+                            if (response.status === 429) throw new Error('TPM 超限，请稍后重试 (429)');
+                            throw new Error(`HTTP 异常 ${response.status}`);
+                        }
+
+                        if (response.headers.get('X-Cache-Hit') === 'true') {
+                            messages.value[aiIndex].isCache = true;
+                        }
+
+                        const reader  = response.body.getReader();
+                        const decoder = new TextDecoder();
+                        let buffer = '';
+                        let done   = false;
+
+                        while (!done) {
+                            const { value, done: streamDone } = await reader.read();
+                            done = streamDone;
+                            if (value) buffer += decoder.decode(value, { stream: true });
+
+                            const lines = buffer.split('\n');
+                            buffer = lines.pop() || '';
+
+                            for (const line of lines) {
+                                const cleanLine = line.trim();
+                                if (!cleanLine.startsWith('data:')) continue;
+
+                                const dataStr = cleanLine.slice(5).trim();
+                                if (dataStr === '[DONE]') { done = true; break; }
+
+                                try {
+                                    const parsed = JSON.parse(dataStr);
+                                    if (parsed.error) {
+                                        messages.value[aiIndex].content += `\n\n> ⚠️ ${parsed.error}`;
+                                        done = true; break;
+                                    }
+                                    const delta     = parsed.choices?.[0]?.delta;
+                                    const chunk     = delta?.content || '';
+                                    const reasoning = delta?.reasoning_content || '';
+
+                                    if (chunk)     messages.value[aiIndex].content   += chunk;
+                                    if (reasoning) messages.value[aiIndex].reasoning += reasoning;
+                                    if (chunk || reasoning) scrollToBottom();
+                                } catch (_) {}
+                            }
+                        }
+                    } catch (err) {
+                        if (err.name === 'AbortError') {
+                            messages.value[aiIndex].content += messages.value[aiIndex].content
+                                ? '\n\n*(已停止生成)*' : '*(已停止生成)*';
+                        } else {
+                            messages.value[aiIndex].content = `> ⚠️ 请求异常：${err.message}`;
+                        }
+                    } finally {
+                        messages.value[aiIndex].streaming = false;
+                        isGenerating.value = false;
+                        abortController = null;
+                        scrollToBottom();
+                    }
+                };
+
+                const stopGenerating = () => { if (abortController) abortController.abort(); };
+
+                return {
+                    inputText, messages, isGenerating, messagesEnd, inputRef,
+                    systemPrompt, systemPromptOpen, healthStatus,
+                    renderMarkdown, autoResize, handleKeydown,
+                    sendMessage, stopGenerating, clearMessages,
+                };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>

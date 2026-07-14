@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  # Redis - 用于分布式限流 (TPM/RPM) 及 Token 预扣费和结算
+  redis:
+    image: redis:7.2-alpine
+    container_name: llm-gateway-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes # 开启 AOF 持久化，防止限流状态和账单丢失
+    restart: always
+
+  # Qdrant - 向量数据库，用于阶段三的语义缓存 (Semantic Cache)
+  qdrant:
+    image: qdrant/qdrant:v1.9.0
+    container_name: llm-gateway-qdrant
+    ports:
+      - "6333:6333" # HTTP API 端口
+      - "6334:6334" # gRPC API 端口
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: always
+
+volumes:
+  redis_data:
+  qdrant_data:
