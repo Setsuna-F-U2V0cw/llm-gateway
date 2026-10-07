@@ -1,18 +1,25 @@
 package com.llmgateway.gateway.service;
 
+import com.llmgateway.gateway.config.GatewayProperties;
 import com.llmgateway.gateway.model.Intent;
-import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
 
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * 意图分类器（阶段四 Router 的核心组件）
@@ -32,15 +39,10 @@ import java.util.concurrent.ConcurrentHashMap;
 public class IntentClassifier {
 
     private final EmbeddingService embeddingService;
+    private final GatewayProperties props;
 
     /** 余弦置信度阈值，低于此值判 DEFAULT（避免对无关 prompt 强行归类） */
     private static final double CONFIDENCE_THRESHOLD = 0.5;
-
-    /**
-     * 意图原型向量。volatile：启动时异步填充，填充前 classify 走规则 fallback。
-     * 用 ConcurrentHashMap 保证可见性与并发安全。
-     */
-    private final Map<Intent, float[]> prototypes = new ConcurrentHashMap<>();
 
     /** 每个 intent 的典范短语（启动时 embed 后取均值得原型向量） */
     private static final Map<Intent, List<String>> PROTOTYPE_PHRASES = Map.of(
@@ -52,45 +54,106 @@ public class IntentClassifier {
             Intent.CHITCHAT, List.of("你好", "今天天气怎么样", "随便聊聊")
     );
 
+    private static final int EXPECTED_PROTOTYPES = PROTOTYPE_PHRASES.size();
+
     /**
-     * 启动时预 embed 意图原型。异步执行，不阻塞启动；Ollama 不可用则 prototypes 保持空，
-     * classify 自动退化为规则分类（fail-open）。
+     * 只发布完整快照：任何一次加载失败，请求看到的仍是上一份完整快照或空 Map，
+     * 不会拿半套意图参与分类。
      */
-    @PostConstruct
-    public void initPrototypes() {
-        Flux.fromIterable(PROTOTYPE_PHRASES.entrySet())
-                .flatMap(entry -> embedAndAverage(entry.getKey(), entry.getValue()))
-                .doOnNext(e -> log.info("意图原型向量就绪: intent={}", e.getKey()))
-                .collectList()
-                .subscribe(
-                        list -> log.info("意图原型加载完成: {} 个", list.size()),
-                        e -> log.warn("意图原型加载失败，分类将退化为规则模式: {}", e.getMessage())
-                );
+    private final AtomicReference<Map<Intent, float[]>> prototypes =
+            new AtomicReference<>(Map.of());
+    private final AtomicLong retryCount = new AtomicLong();
+    private final AtomicReference<PrototypeStatus> prototypeStatus =
+            new AtomicReference<>(new PrototypeStatus("loading", 0, EXPECTED_PROTOTYPES, 0, null));
+    private volatile Disposable prototypeLoader;
+
+    public record PrototypeStatus(
+            String state,
+            int loaded,
+            int expected,
+            long retries,
+            String lastError
+    ) {}
+
+    /**
+     * 应用就绪后启动唯一后台加载器。失败时指数退避重试，请求线程从不负责触发加载。
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public synchronized void startPrototypeLoading() {
+        if (prototypeLoader != null && !prototypeLoader.isDisposed()) {
+            return;
+        }
+        prototypeLoader = loadUntilReady().subscribe(
+                null,
+                e -> log.error("意图原型后台加载器异常终止: {}", e.getMessage())
+        );
+    }
+
+    Mono<Void> loadUntilReady() {
+        GatewayProperties.PrototypeRetryConfig retry = props.getPrototypeRetry();
+        Duration initial = Duration.ofMillis(Math.max(1L, retry.getInitialDelayMs()));
+        Duration max = Duration.ofMillis(Math.max(initial.toMillis(), retry.getMaxDelayMs()));
+        double jitter = Math.max(0.0, Math.min(1.0, retry.getJitter()));
+
+        return Mono.defer(this::loadCompleteSnapshot)
+                .retryWhen(Retry.backoff(Long.MAX_VALUE, initial)
+                        .maxBackoff(max)
+                        .jitter(jitter)
+                        .doBeforeRetry(signal -> {
+                            long retries = retryCount.incrementAndGet();
+                            String error = safeMessage(signal.failure());
+                            prototypeStatus.set(new PrototypeStatus(
+                                    "retrying", 0, EXPECTED_PROTOTYPES, retries, error));
+                            log.warn("意图原型加载失败，第 {} 次重试: {}", retries, error);
+                        }))
+                .doOnNext(snapshot -> {
+                    prototypes.set(snapshot);
+                    prototypeStatus.set(new PrototypeStatus(
+                            "ready", snapshot.size(), EXPECTED_PROTOTYPES,
+                            retryCount.get(), null));
+                    log.info("意图原型加载完成并原子发布: {} 个", snapshot.size());
+                })
+                .then();
+    }
+
+    private Mono<Map<Intent, float[]>> loadCompleteSnapshot() {
+        prototypeStatus.set(new PrototypeStatus(
+                retryCount.get() == 0 ? "loading" : "retrying",
+                0, EXPECTED_PROTOTYPES, retryCount.get(),
+                prototypeStatus.get().lastError()));
+
+        return Flux.fromIterable(PROTOTYPE_PHRASES.entrySet())
+                // 单个 Ollama 实例避免 18 路同时冷启动；每个意图内最多并发 3 条短语。
+                .concatMap(entry -> embedAndAverage(entry.getKey(), entry.getValue()))
+                .doOnNext(e -> log.debug("意图原型计算完成: intent={}", e.getKey()))
+                .collect(
+                        () -> new EnumMap<Intent, float[]>(Intent.class),
+                        (map, entry) -> map.put(entry.getKey(), entry.getValue()))
+                .flatMap(map -> map.size() == EXPECTED_PROTOTYPES
+                        ? Mono.just(Map.copyOf(map))
+                        : Mono.error(new IllegalStateException(
+                                "意图原型数量不完整: " + map.size() + "/" + EXPECTED_PROTOTYPES)));
     }
 
     private Mono<Map.Entry<Intent, float[]>> embedAndAverage(Intent intent, List<String> phrases) {
         return Flux.fromIterable(phrases)
-                .flatMap(embeddingService::embed)
+                .flatMapSequential(embeddingService::embed, 3)
                 .collectList()
-                .map(vecs -> {
-                    float[] avg = average(vecs);
-                    prototypes.put(intent, avg);
-                    return Map.entry(intent, avg);
-                });
+                .map(vecs -> Map.entry(intent, average(vecs)));
     }
 
     /**
-     * 按给定 prompt embedding 分类意图（主路径，零额外调用）
-     *
-     * @return 最相似的 Intent；若 prototypes 未就绪或 max 余弦 < 阈值 → DEFAULT
+     * 分类的唯一公开接口。完整原型就绪且请求 embedding 可用时走余弦分类；
+     * 其余情况在模块内部自动走规则 fallback。
      */
-    public Intent classify(float[] embedding) {
-        if (embedding == null || prototypes.isEmpty()) {
-            return Intent.DEFAULT;
+    public Intent classify(float[] embedding, String prompt) {
+        Map<Intent, float[]> snapshot = prototypes.get();
+        if (embedding == null || snapshot.size() != EXPECTED_PROTOTYPES) {
+            return classifyByRules(prompt);
         }
         Intent best = Intent.DEFAULT;
         double bestSim = CONFIDENCE_THRESHOLD;
-        for (Map.Entry<Intent, float[]> e : prototypes.entrySet()) {
+        for (Map.Entry<Intent, float[]> e : snapshot.entrySet()) {
             double sim = cosine(embedding, e.getValue());
             if (sim > bestSim) {
                 bestSim = sim;
@@ -101,10 +164,22 @@ public class IntentClassifier {
         return best;
     }
 
+    public PrototypeStatus prototypeStatus() {
+        return prototypeStatus.get();
+    }
+
+    @PreDestroy
+    public void stopPrototypeLoading() {
+        Disposable loader = prototypeLoader;
+        if (loader != null) {
+            loader.dispose();
+        }
+    }
+
     /**
      * 规则分类（embedding 不可用时的 fallback）。关键词粗匹配。
      */
-    public Intent classifyByRules(String prompt) {
+    Intent classifyByRules(String prompt) {
         if (prompt == null || prompt.isBlank()) return Intent.DEFAULT;
         String p = prompt.toLowerCase();
         if (containsAny(p, "代码", "编程", "function", "bug", "实现", "编译")) return Intent.CODE;
@@ -135,6 +210,9 @@ public class IntentClassifier {
     }
 
     private double cosine(float[] a, float[] b) {
+        if (a.length != b.length) {
+            return 0;
+        }
         double dot = 0, na = 0, nb = 0;
         for (int i = 0; i < a.length; i++) {
             dot += a[i] * b[i];
@@ -143,5 +221,10 @@ public class IntentClassifier {
         }
         if (na == 0 || nb == 0) return 0;
         return dot / (Math.sqrt(na) * Math.sqrt(nb));
+    }
+
+    private String safeMessage(Throwable error) {
+        String message = error.getMessage();
+        return message == null ? error.getClass().getSimpleName() : message;
     }
 }

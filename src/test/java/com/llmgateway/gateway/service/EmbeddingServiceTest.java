@@ -29,7 +29,7 @@ class EmbeddingServiceTest {
         server = new MockWebServer();
         server.start();
         props = new GatewayProperties();
-        props.setOllamaEmbedModel("bge-large-zh-v1.5");
+        props.setOllamaEmbedModel("bge-m3");
         props.setEmbeddingDimension(1024);
         // 去掉 MockWebServer URL 末尾斜杠，避免与 "/api/embed" 拼成双斜杠
         props.setOllamaBaseUrl(server.url("").toString().replaceAll("/$", ""));

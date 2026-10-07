@@ -28,6 +28,8 @@ class TtftTimeoutTest {
             "{\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}";
     private static final String CONTENT_FRAME =
             "{\"choices\":[{\"delta\":{\"content\":\"好\"}}]}";
+    private static final String REASONING_FRAME =
+            "{\"choices\":[{\"delta\":{\"reasoning_content\":\"思考中\"}}]}";
 
     /** 复刻 LlmProxyService.hasContent：content 或 reasoning_content 非空 */
     private boolean hasContent(String chunk) {
@@ -90,5 +92,18 @@ class TtftTimeoutTest {
         StepVerifier.withVirtualTime(() -> withTtft(Flux.never(), 1000))
                 .thenAwait(Duration.ofMillis(1000))
                 .verifyError(TimeoutException.class);
+    }
+
+    @Test
+    void reasoningFrameDisablesTimeout() {
+        Flux<String> source = Flux.concat(
+                Mono.delay(Duration.ofMillis(200)).map(x -> REASONING_FRAME),
+                Flux.just("[DONE]")
+        );
+
+        StepVerifier.withVirtualTime(() -> withTtft(source, 1000))
+                .expectNext(REASONING_FRAME)
+                .expectNext("[DONE]")
+                .verifyComplete();
     }
 }

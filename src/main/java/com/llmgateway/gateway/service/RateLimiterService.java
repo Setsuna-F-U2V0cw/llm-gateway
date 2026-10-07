@@ -9,7 +9,6 @@ import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
-import java.time.Instant;
 import java.util.List;
 
 /**
@@ -19,6 +18,7 @@ import java.util.List;
  * - Lua 脚本在 Redis 单线程中执行，天然原子性，彻底解决分布式环境下的 Token 超卖问题
  * - ReactiveRedisTemplate（底层 Lettuce）以非阻塞方式发送命令，不占用 Netty EventLoop 线程
  * - Mono.flatMap 串联限流与转发，整条链路零阻塞
+ * - refill 时钟用 Redis TIME，TTL 大于读超时；settle 在 key 过期时重建完整 hash
  */
 @Slf4j
 @Service
@@ -31,6 +31,10 @@ public class RateLimiterService {
     // 预加载 Lua 脚本（启动时编译，运行时直接执行 EVALSHA，减少网络传输）
     private static final RedisScript<Long> TOKEN_BUCKET_SCRIPT = RedisScript.of(
             new ClassPathResource("scripts/token_bucket.lua"), Long.class
+    );
+
+    private static final RedisScript<Long> SETTLE_SCRIPT = RedisScript.of(
+            new ClassPathResource("scripts/token_bucket_settle.lua"), Long.class
     );
 
     private static final String KEY_PREFIX = "tpm:";
@@ -49,10 +53,10 @@ public class RateLimiterService {
      */
     public Mono<Boolean> tryAcquire(String userId, int tokenCost) {
         String key = KEY_PREFIX + userId;
-        long now = Instant.now().getEpochSecond();
+        int ttl = props.resolveTpmBucketTtlSeconds();
 
-        // [💎 面试亮点] 使用 EVALSHA 执行 Lua，参数动态传入（容量、补充速率、时间戳），
-        // 令牌桶完全在 Redis 侧计算，网关无状态，天然支持水平扩展
+        // [💎 面试亮点] EVALSHA 只传 cost/capacity/rate/ttl；now 由 Lua 调 Redis TIME，
+        // 多实例网关时钟一致，桶完全在 Redis 侧计算。
         return reactiveRedisTemplate.execute(
                 TOKEN_BUCKET_SCRIPT,
                 List.of(key),
@@ -60,7 +64,7 @@ public class RateLimiterService {
                         String.valueOf(tokenCost),
                         String.valueOf(props.getTpmCapacity()),
                         String.valueOf(props.getTpmRefillRatePerSecond()),
-                        String.valueOf(now)
+                        String.valueOf(ttl)
                 )
         )
         .next()
@@ -76,23 +80,39 @@ public class RateLimiterService {
     }
 
     /**
-     * 结算真实消耗：将多扣的 Token 归还桶中（多退少补）
-     *
-     * @param userId        用户 ID
-     * @param estimatedCost 预扣数量
-     * @param actualCost    真实消耗数量
+     * 结算真实消耗：多退少补。
+     * <ul>
+     *   <li>estimated &gt; actual → 归还差额</li>
+     *   <li>estimated &lt; actual → 补扣差额（桶内 tokens 下限钳到 0）</li>
+     *   <li>相等 → no-op</li>
+     *   <li>桶已过期 → Lua 重建完整 hash（tokens + last_refill_time），禁止裸 HINCRBY</li>
+     * </ul>
      */
     public Mono<Void> settle(String userId, int estimatedCost, int actualCost) {
-        int refund = estimatedCost - actualCost;
-        if (refund <= 0) {
+        int delta = estimatedCost - actualCost;
+        if (delta == 0) {
             return Mono.empty();
         }
-        // 将多扣的 Token 通过 HINCRBY 归还
         String key = KEY_PREFIX + userId;
-        return reactiveRedisTemplate.opsForHash()
-                .increment(key, "tokens", refund)
-                .doOnNext(newTokens -> log.debug("Token 结算归还: userId={}, refund={}, newTokens={}",
-                        userId, refund, newTokens))
+        int ttl = props.resolveTpmBucketTtlSeconds();
+        return reactiveRedisTemplate.execute(
+                        SETTLE_SCRIPT,
+                        List.of(key),
+                        List.of(
+                                String.valueOf(delta),
+                                String.valueOf(props.getTpmCapacity()),
+                                String.valueOf(ttl)
+                        )
+                )
+                .next()
+                .doOnNext(newTokens -> log.debug(
+                        "Token 结算: userId={}, estimated={}, actual={}, delta={}, tokensAfter={}",
+                        userId, estimatedCost, actualCost, delta, newTokens))
+                // 结算失败不回灌主链路：预扣已发生，账单以尽力而为更新
+                .onErrorResume(e -> {
+                    log.error("Token 结算失败: userId={}, {}", userId, e.getMessage());
+                    return Mono.empty();
+                })
                 .then();
     }
 }

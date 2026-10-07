@@ -36,29 +36,25 @@ public class SemanticCacheService {
     private final ObjectMapper objectMapper;
 
     /**
-     * 按给定 embedding 检索语义缓存
-     *
-     * 若命中，返回 Optional 内带伪装成 SSE 流的 Flux<String>。
-     * 若未命中（或 embedding 为 null / 检索失败），返回 Optional.empty()。
-     *
-     * [💎 面试亮点] 缓存命中判定建模为 Mono<Optional<Flux<String>>>：命中标志在订阅 SSE 流
-     * 之前就确定（向量检索完成即决出 hit/miss），上层据此在 ResponseEntity 写 X-Cache-Hit 头。
-     *
-     * @param embedding prompt 向量（由 pipeline 顶部算好传入）；为 null 时直接返回未命中（fail-open）
-     * @param model     请求的 model id，用于伪装 SSE chunk 的 model 字段
-     * @return 命中时 Optional 内带伪装 SSE 流；未命中时 Optional.empty()
+     * 缓存命中结果：流在订阅前即可拿到，供上层提前写 X-Cache-Hit。
      */
-    public Mono<Optional<Flux<String>>> searchCache(float[] embedding, String model) {
+    public record CacheHit(Flux<String> stream) {}
+
+    /**
+     * 按给定 embedding 检索语义缓存（仅同一 tenant + 同一请求 model）。
+     *
+     * [💎 面试亮点] 判定建模为 Mono&lt;Optional&lt;CacheHit&gt;&gt;：命中标志在订阅 SSE 之前决出，
+     * 上层写 X-Cache-Hit，并按实际回放给客户端的 content 做预扣结算。
+     */
+    public Mono<Optional<CacheHit>> searchCache(float[] embedding, String model, String userId) {
         if (embedding == null) {
-            // embedding 不可用（顶部 embed fail-open）→ 降级为未命中，走透传 + 规则路由
             return Mono.just(Optional.empty());
         }
 
-        return vectorStoreService.search(embedding)
-                .map(cachedAnswer -> Optional.of(simulateSseStream(cachedAnswer, model)))
-                // vectorStoreService.search 未命中时返回 Mono.empty()，补一个空 Optional 表示未命中
+        return vectorStoreService.search(embedding, userId, model)
+                .map(cachedAnswer -> Optional.of(
+                        new CacheHit(simulateSseStream(cachedAnswer, model))))
                 .defaultIfEmpty(Optional.empty())
-                // 任何环节出错都降级为未命中（fail-open），保证主流程不受影响
                 .onErrorResume(e -> {
                     log.warn("语义缓存查询异常，降级透传: {}", e.getMessage());
                     return Mono.just(Optional.empty());
@@ -74,20 +70,25 @@ public class SemanticCacheService {
      *
      * 阶段四：embedding 由 pipeline 顶部传入复用，本方法不再调 EmbeddingService。
      *
-     * @param embedding prompt 向量（复用检索时的同一向量）；为 null 时跳过写入
-     * @param request   原始请求（用于提取 prompt 元数据，若需要）
-     * @param answer    LLM 完整回答（从 SSE chunks 拼接而来，只含 content，不含 reasoning）
+     * @param embedding  prompt 向量（复用检索时的同一向量）；为 null 时跳过写入
+     * @param request    原始请求（提取 prompt）
+     * @param answer     只含 content 的完整回答
+     * @param userId     租户，写入 payload.tenant_id
+     * @param cacheModel 客户端请求的 model（路由改写之前），写入 payload.model
      */
-    public void saveToCache(float[] embedding, ChatRequest request, String answer) {
+    public void saveToCache(float[] embedding, ChatRequest request, String answer,
+                            String userId, String cacheModel) {
         if (embedding == null || answer == null || answer.isBlank()) return;
 
-        vectorStoreService.save(embedding, extractPrompt(request), answer)
+        String prompt = extractPrompt(request);
+        vectorStoreService.save(embedding, prompt, answer, userId, cacheModel)
                 .subscribeOn(Schedulers.boundedElastic())
                 .subscribe(
                         null,
                         e -> log.warn("语义缓存写入失败: {}", e.getMessage()),
-                        () -> log.debug("语义缓存写入完成: promptLen={}, answerLen={}",
-                                extractPrompt(request) == null ? 0 : extractPrompt(request).length(),
+                        () -> log.debug("语义缓存写入完成: tenant={}, model={}, promptLen={}, answerLen={}",
+                                userId, cacheModel,
+                                prompt == null ? 0 : prompt.length(),
                                 answer.length())
                 );
     }
@@ -118,8 +119,8 @@ public class SemanticCacheService {
      * 构造 OpenAI 标准 SSE chunk 的 JSON payload
      *
      * [💣 踩坑预警] 只返回 JSON payload，不拼 "data: " 前缀和 "\n\n"。
-     * Controller 返回 Flux<String> + produces=text/event-stream，Spring 的
-     * ServerSentEventHttpMessageWriter 会对每个 String 元素自动加 "data: " 前缀和 "\n\n"。
+     * Controller 返回 Mono&lt;ResponseEntity&lt;Flux&lt;String&gt;&gt;&gt; + produces=text/event-stream，Spring 的
+     * ServerSentEventHttpMessageWriter 会对每个 String 元素自动加 "data:" 前缀和 "\n\n"。
      */
     private String buildSseChunk(String content, String model) {
         try {

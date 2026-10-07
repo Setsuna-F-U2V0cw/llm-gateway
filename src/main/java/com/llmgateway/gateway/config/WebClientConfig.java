@@ -8,6 +8,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.netty.http.client.HttpClient;
+import reactor.netty.resources.ConnectionProvider;
 
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
@@ -17,69 +18,74 @@ import java.util.concurrent.TimeUnit;
  *
  * 核心设计要点：
  * 1. 使用 Reactor Netty 的 HttpClient 作为底层连接器
- * 2. 配置连接超时、读写超时，防止下游 LLM 响应过慢导致连接泄漏
+ * 2. 主链路与 Embedding 使用独立 ConnectionProvider，避免长 SSE 占满短请求池
  * 3. WebClient 本身是非阻塞的，所有 IO 操作都在 Netty EventLoop 线程上执行
  */
 @Configuration
 public class WebClientConfig {
 
     /**
-     * 构建全局 WebClient Bean
+     * 主链路 WebClient（LLM SSE 透传 + fallback）。
      *
-     * [面试亮点] WebClient 底层使用 Reactor Netty，基于 NIO 多路复用。
-     * 相比 RestTemplate 的线程-per-请求模型，单个 EventLoop 线程可同时
-     * 处理数千个并发连接，彻底解决大模型长连接场景下的 C10K 问题。
+     * [面试亮点] 显式 ConnectionProvider：默认 {@code HttpClient.create()} 池大约
+     * maxConnections=500，并发活跃 SSE 超过后会在 pendingAcquire 上排队，表现为 TTFT
+     * 飙升或 fallback 风暴，而 EventLoop 本身并未饱和。
      */
     @Bean
     public WebClient webClient(GatewayProperties props) {
-        HttpClient httpClient = HttpClient.create()
-            // TCP 连接超时：防止下游服务不可达时无限等待
-            .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, props.getConnectTimeoutMs())
-            // 响应超时：流式场景需要较长时间
-            .responseTimeout(Duration.ofMillis(props.getReadTimeoutMs()))
-            .doOnConnected(conn ->
-                conn
-                    // 读超时 Handler：在 Netty Pipeline 级别控制，比应用层更精准
-                    .addHandlerLast(new ReadTimeoutHandler(props.getReadTimeoutMs(), TimeUnit.MILLISECONDS))
-                    // 写超时 Handler
-                    .addHandlerLast(new WriteTimeoutHandler(props.getConnectTimeoutMs(), TimeUnit.MILLISECONDS))
-            );
-
+        ConnectionProvider provider = ConnectionProvider.builder("llm-primary")
+                .maxConnections(props.getWebClientMaxConnections())
+                .pendingAcquireMaxCount(props.getWebClientPendingAcquireMaxCount())
+                .pendingAcquireTimeout(Duration.ofSeconds(10))
+                .maxIdleTime(Duration.ofSeconds(60))
+                .maxLifeTime(Duration.ofMinutes(10))
+                .evictInBackground(Duration.ofSeconds(30))
+                .metrics(true)
+                .build();
+        HttpClient httpClient = buildHttpClient(
+                provider, props.getConnectTimeoutMs(), props.getReadTimeoutMs());
         return WebClient.builder()
-            .clientConnector(new ReactorClientHttpConnector(httpClient))
-            // 调大 buffer 上限，防止大 JSON 响应体被截断
-            .codecs(configurer ->
-                configurer.defaultCodecs().maxInMemorySize(10 * 1024 * 1024)
-            )
-            .build();
+                .clientConnector(new ReactorClientHttpConnector(httpClient))
+                .codecs(configurer ->
+                        configurer.defaultCodecs().maxInMemorySize(10 * 1024 * 1024))
+                .build();
     }
 
     /**
-     * Ollama 专用 WebClient Bean（Embedding 调用）
+     * Ollama 专用 WebClient（Embedding / 健康检查）。独立小池，不与 SSE 争抢。
      *
-     * [面试亮点] 与主链路 WebClient 区分：Embedding 是短非流式 POST，
-     * 用独立的更短读取超时（ollamaReadTimeoutMs=30s），避免 Ollama 卡住时
-     * 连接被占满 120s。两个 WebClient 各司其职，超时策略按场景定制。
-     *
-     * 命名 bean，注入处需用 @Qualifier("ollamaWebClient") 显式指定。
+     * 命名 bean，注入处需用 {@code @Qualifier("ollamaWebClient")} 显式指定。
      */
     @Bean("ollamaWebClient")
     public WebClient ollamaWebClient(GatewayProperties props) {
-        HttpClient httpClient = HttpClient.create()
-            .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, props.getConnectTimeoutMs())
-            // Embedding 短请求，用更短响应超时
-            .responseTimeout(Duration.ofMillis(props.getOllamaReadTimeoutMs()))
-            .doOnConnected(conn ->
-                conn
-                    .addHandlerLast(new ReadTimeoutHandler(props.getOllamaReadTimeoutMs(), TimeUnit.MILLISECONDS))
-                    .addHandlerLast(new WriteTimeoutHandler(props.getConnectTimeoutMs(), TimeUnit.MILLISECONDS))
-            );
-
+        int max = props.getOllamaWebClientMaxConnections();
+        ConnectionProvider provider = ConnectionProvider.builder("llm-ollama")
+                .maxConnections(max)
+                .pendingAcquireMaxCount(Math.max(max * 2, 400))
+                .pendingAcquireTimeout(Duration.ofSeconds(5))
+                .maxIdleTime(Duration.ofSeconds(30))
+                .maxLifeTime(Duration.ofMinutes(5))
+                .evictInBackground(Duration.ofSeconds(30))
+                .metrics(true)
+                .build();
+        HttpClient httpClient = buildHttpClient(
+                provider, props.getConnectTimeoutMs(), props.getOllamaReadTimeoutMs());
         return WebClient.builder()
-            .clientConnector(new ReactorClientHttpConnector(httpClient))
-            .codecs(configurer ->
-                configurer.defaultCodecs().maxInMemorySize(10 * 1024 * 1024)
-            )
-            .build();
+                .clientConnector(new ReactorClientHttpConnector(httpClient))
+                .codecs(configurer ->
+                        configurer.defaultCodecs().maxInMemorySize(10 * 1024 * 1024))
+                .build();
+    }
+
+    private static HttpClient buildHttpClient(ConnectionProvider provider,
+                                              int connectTimeoutMs,
+                                              int ioTimeoutMs) {
+        return HttpClient.create(provider)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, connectTimeoutMs)
+                .responseTimeout(Duration.ofMillis(ioTimeoutMs))
+                .doOnConnected(conn -> conn
+                        .addHandlerLast(new ReadTimeoutHandler(ioTimeoutMs, TimeUnit.MILLISECONDS))
+                        // 写超时与读超时对齐：大 JSON body 在慢上行上不能用 5s connect 超时卡住
+                        .addHandlerLast(new WriteTimeoutHandler(ioTimeoutMs, TimeUnit.MILLISECONDS)));
     }
 }

@@ -14,7 +14,7 @@ import java.util.List;
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class ChatRequest {
 
-    /** 模型 ID，如 deepseek-chat、deepseek-reasoner */
+    /** 模型 ID，如 deepseek-v4-flash、deepseek-v4-flash-thinking；空 / auto 走意图路由 */
     private String model;
 
     /** 对话消息列表 */

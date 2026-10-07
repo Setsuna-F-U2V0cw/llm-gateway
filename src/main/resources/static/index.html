@@ -10,6 +10,8 @@
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <!-- marked.js：Markdown 解析 -->
     <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+    <!-- DOMPurify：消毒 marked 产出的 HTML，避免 v-html XSS 窃取 sessionStorage Key -->
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js"></script>
     <!-- highlight.js：代码块语法高亮 -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
     <script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/highlight.min.js"></script>
@@ -125,8 +127,18 @@
             </div>
         </header>
 
+        <!-- ── Tab：聊天 / 诊断 / 配置 ── -->
+        <nav class="bg-white shadow-sm border border-slate-200 rounded-2xl p-1 mb-4 flex space-x-1">
+            <button v-for="item in tabs" :key="item.id"
+                    @click="activeTab = item.id"
+                    :class="['flex-1 px-3 py-2 rounded-xl text-xs font-medium transition-colors',
+                             activeTab === item.id ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:bg-slate-50']">
+                {{ item.label }}
+            </button>
+        </nav>
+
         <!-- ── System Prompt 折叠面板 ── -->
-        <div class="bg-white shadow-sm border border-slate-200 rounded-2xl mb-4 overflow-hidden">
+        <div v-show="activeTab === 'chat'" class="bg-white shadow-sm border border-slate-200 rounded-2xl mb-4 overflow-hidden">
             <button @click="systemPromptOpen = !systemPromptOpen"
                     class="w-full flex items-center justify-between px-4 py-2.5 text-xs font-medium text-slate-500 hover:bg-slate-50 transition-colors">
                 <span class="flex items-center space-x-1.5">
@@ -151,7 +163,7 @@
         </div>
 
         <!-- ── 聊天记录区 ── -->
-        <main class="flex-1 bg-white shadow-sm border border-slate-200 rounded-2xl p-6 overflow-y-auto mb-4 space-y-4">
+        <main v-show="activeTab === 'chat'" class="flex-1 bg-white shadow-sm border border-slate-200 rounded-2xl p-6 overflow-y-auto mb-4 space-y-4">
             <div v-if="messages.length === 0" class="h-full flex flex-col items-center justify-center text-slate-400 space-y-2">
                 <svg class="w-12 h-12 text-slate-300" fill="none" viewBox="0 0 24 24" stroke-width="1" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" d="M20.25 8.511c.884.284 1.5 1.128 1.5 2.097v4.286c0 1.136-.847 2.1-1.98 2.193-.34.027-.68.052-1.02.072v3.091l-3-3c-1.354 0-2.694-.055-4.02-.163a2.115 2.115 0 0 1-.825-.242m9.345-8.334a2.126 2.126 0 0 0-.476-.095 48.64 48.64 0 0 0-8.048 0c-1.131.094-1.976 1.057-1.976 2.192v4.286c0 .837.46 1.58 1.155 1.951m9.345-8.334V6.637c0-1.621-1.152-3.026-2.76-3.235A48.455 48.455 0 0 0 11.25 3c-2.115 0-4.198.137-6.24.402-1.608.209-2.76 1.614-2.76 3.235v6.226c0 1.621 1.152 3.026 2.76 3.235.577.075 1.157.14 1.74.194V21l4.155-4.155" />
@@ -211,8 +223,103 @@
             <div ref="messagesEnd"></div>
         </main>
 
+        <!-- ── 诊断：下游依赖 ── -->
+        <section v-show="activeTab === 'diag'" class="flex-1 bg-white shadow-sm border border-slate-200 rounded-2xl p-6 mb-4 overflow-y-auto">
+            <div class="flex items-center justify-between mb-4">
+                <div>
+                    <h2 class="text-sm font-semibold text-slate-800">下游依赖</h2>
+                    <p class="text-[11px] text-slate-400 mt-0.5">并行探测 Redis / Qdrant / Ollama。网关 fail-open，依赖挂了仍可接请求。</p>
+                </div>
+                <button @click="refreshDeps" class="text-xs px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600 hover:bg-slate-200">
+                    {{ depsLoading ? '探测中…' : '刷新' }}
+                </button>
+            </div>
+            <p class="text-xs mb-4" :class="depsStatus === 'up' ? 'text-green-700' : depsStatus === 'degraded' ? 'text-amber-700' : 'text-slate-400'">
+                聚合状态：{{ depsStatus || '尚未探测' }}
+            </p>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div v-for="c in depComponents" :key="c.name"
+                     class="border rounded-xl p-4"
+                     :class="c.status === 'up' ? 'border-green-200 bg-green-50' : 'border-red-200 bg-red-50'">
+                    <div class="flex items-center justify-between">
+                        <span class="text-sm font-medium text-slate-800 uppercase">{{ c.name }}</span>
+                        <span class="text-[10px] font-semibold px-1.5 py-0.5 rounded"
+                              :class="c.status === 'up' ? 'bg-green-200 text-green-800' : 'bg-red-200 text-red-800'">
+                            {{ c.status }}
+                        </span>
+                    </div>
+                    <p class="text-[11px] text-slate-500 mt-2">{{ c.latency_ms }} ms</p>
+                    <p class="text-[11px] text-slate-400 mt-1 break-all">{{ c.detail || '—' }}</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── 配置：只读网关参数 + 模型注册表 ── -->
+        <section v-show="activeTab === 'config'" class="flex-1 bg-white shadow-sm border border-slate-200 rounded-2xl p-6 mb-4 overflow-y-auto">
+            <h2 class="text-sm font-semibold text-slate-800 mb-3">网关认证</h2>
+            <div class="flex gap-2 mb-2">
+                <input v-model="apiKey"
+                       @keyup.enter="saveApiKey"
+                       type="password"
+                       autocomplete="off"
+                       placeholder="输入租户 API Key"
+                       class="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-indigo-400">
+                <button @click="saveApiKey"
+                        class="px-3 py-2 rounded-lg bg-indigo-600 text-white text-xs hover:bg-indigo-700">
+                    连接
+                </button>
+                <button v-if="apiKeyStored" @click="clearApiKey"
+                        class="px-3 py-2 rounded-lg bg-slate-100 text-slate-500 text-xs hover:bg-slate-200">
+                    清除
+                </button>
+            </div>
+            <p class="text-[10px] mb-6"
+               :class="authStatus === 'ok' ? 'text-green-600' : authStatus === 'invalid' ? 'text-red-600' : 'text-slate-400'">
+                {{ authStatus === 'ok' ? '认证成功' :
+                   authStatus === 'invalid' ? 'API Key 无效，请重新输入' :
+                   'Key 仅保存在当前标签页的 sessionStorage 中' }}
+            </p>
+
+            <h2 class="text-sm font-semibold text-slate-800 mb-3">运行时参数（只读）</h2>
+            <dl class="grid grid-cols-2 gap-x-4 gap-y-2 text-xs mb-6">
+                <template v-for="(val, key) in gatewayInfo" :key="key">
+                    <dt class="text-slate-400">{{ key }}</dt>
+                    <dd class="text-slate-800 font-mono break-all">{{ formatConfigValue(val) }}</dd>
+                </template>
+            </dl>
+            <h2 class="text-sm font-semibold text-slate-800 mb-3">已注册模型</h2>
+            <table class="w-full text-xs border-collapse">
+                <thead>
+                    <tr class="text-left text-slate-400 border-b border-slate-200">
+                        <th class="py-2 pr-2">id</th>
+                        <th class="py-2 pr-2">request_model</th>
+                        <th class="py-2 pr-2">思考</th>
+                        <th class="py-2">max_context</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr v-for="m in models" :key="m.id" class="border-b border-slate-100">
+                        <td class="py-2 pr-2 font-mono text-slate-800">{{ m.id }}</td>
+                        <td class="py-2 pr-2 font-mono text-slate-500">{{ m.request_model || '—' }}</td>
+                        <td class="py-2 pr-2">{{ m.is_thinking ? '是' : '否' }}</td>
+                        <td class="py-2 font-mono">{{ m.max_context }}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
         <!-- ── 输入控制区 ── -->
-        <footer class="bg-white shadow-sm border border-slate-200 rounded-2xl p-4">
+        <footer v-show="activeTab === 'chat'" class="bg-white shadow-sm border border-slate-200 rounded-2xl p-4">
+            <div class="flex items-center mb-3">
+                <label class="text-[11px] text-slate-400 mr-2 shrink-0">模型</label>
+                <select v-model="selectedModel"
+                        class="flex-1 border border-slate-200 rounded-lg px-3 py-1.5 text-xs text-slate-700 bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400">
+                    <option value="auto">自动（意图路由）</option>
+                    <option v-for="m in models" :key="m.id" :value="m.id">
+                        {{ m.id }}{{ m.is_thinking ? ' · 思考' : '' }}{{ m.max_context ? ' · ' + m.max_context : '' }}
+                    </option>
+                </select>
+            </div>
             <div class="flex items-end space-x-3">
 
                 <textarea
@@ -273,9 +380,33 @@
                 const systemPrompt    = ref('');
                 const systemPromptOpen = ref(false);
                 const healthStatus    = ref('checking');
+                const activeTab       = ref('chat');
+                const tabs            = [
+                    { id: 'chat', label: '聊天' },
+                    { id: 'diag', label: '诊断' },
+                    { id: 'config', label: '配置' },
+                ];
+                const models          = ref([]);
+                const selectedModel   = ref('auto');
+                const depComponents   = ref([]);
+                const depsStatus      = ref('');
+                const depsLoading     = ref(false);
+                const gatewayInfo     = ref({});
+                const apiKey          = ref(sessionStorage.getItem('llmGatewayApiKey') || '');
+                const apiKeyStored    = ref(Boolean(apiKey.value));
+                const authStatus      = ref(apiKey.value ? 'checking' : 'required');
                 let   abortController = null;
 
-                // ── 健康检查 ──
+                const authHeaders = () => apiKey.value.trim()
+                    ? { 'Authorization': `Bearer ${apiKey.value.trim()}` }
+                    : {};
+
+                const markUnauthorized = () => {
+                    authStatus.value = 'invalid';
+                    models.value = [];
+                    depsStatus.value = 'unauthorized';
+                };
+
                 const checkHealth = async () => {
                     try {
                         const res = await fetch('/v1/health', { signal: AbortSignal.timeout(3000) });
@@ -284,13 +415,112 @@
                         healthStatus.value = 'error';
                     }
                 };
+
+                const refreshDeps = async () => {
+                    if (!apiKey.value.trim()) {
+                        depsStatus.value = 'unauthorized';
+                        depComponents.value = [];
+                        return;
+                    }
+                    depsLoading.value = true;
+                    try {
+                        const res = await fetch('/v1/health/deps', {
+                            headers: authHeaders(),
+                            signal: AbortSignal.timeout(5000)
+                        });
+                        if (res.status === 401) {
+                            markUnauthorized();
+                            return;
+                        }
+                        if (!res.ok) throw new Error(res.status);
+                        const body = await res.json();
+                        authStatus.value = 'ok';
+                        depsStatus.value = body.status || '';
+                        depComponents.value = body.components || [];
+                        gatewayInfo.value = body.gateway || {};
+                    } catch (_) {
+                        depsStatus.value = 'error';
+                        depComponents.value = [
+                            { name: 'redis', status: 'down', latency_ms: 0, detail: '探测失败' },
+                            { name: 'qdrant', status: 'down', latency_ms: 0, detail: '探测失败' },
+                            { name: 'ollama', status: 'down', latency_ms: 0, detail: '探测失败' },
+                        ];
+                    } finally {
+                        depsLoading.value = false;
+                    }
+                };
+
+                const loadModels = async () => {
+                    if (!apiKey.value.trim()) {
+                        models.value = [];
+                        return;
+                    }
+                    try {
+                        const res = await fetch('/v1/models', {
+                            headers: authHeaders(),
+                            signal: AbortSignal.timeout(3000)
+                        });
+                        if (res.status === 401) {
+                            markUnauthorized();
+                            return;
+                        }
+                        if (!res.ok) return;
+                        const body = await res.json();
+                        authStatus.value = 'ok';
+                        models.value = body.data || [];
+                    } catch (_) {
+                        models.value = [];
+                    }
+                };
+
+                const saveApiKey = async () => {
+                    const value = apiKey.value.trim();
+                    if (!value) {
+                        clearApiKey();
+                        return;
+                    }
+                    apiKey.value = value;
+                    sessionStorage.setItem('llmGatewayApiKey', value);
+                    apiKeyStored.value = true;
+                    authStatus.value = 'checking';
+                    await Promise.all([refreshDeps(), loadModels()]);
+                };
+
+                const clearApiKey = () => {
+                    apiKey.value = '';
+                    apiKeyStored.value = false;
+                    authStatus.value = 'required';
+                    models.value = [];
+                    depComponents.value = [];
+                    depsStatus.value = 'unauthorized';
+                    gatewayInfo.value = {};
+                    sessionStorage.removeItem('llmGatewayApiKey');
+                };
+
                 checkHealth();
+                if (apiKey.value) {
+                    refreshDeps();
+                    loadModels();
+                }
                 setInterval(checkHealth, 30000);
+                setInterval(refreshDeps, 30000);
 
                 const renderMarkdown = (text) => {
                     if (!text) return '';
-                    try { return marked.parse(text); } catch (_) { return text; }
+                    const escapeText = (value) => {
+                        const div = document.createElement('div');
+                        div.textContent = value;
+                        return div.innerHTML;
+                    };
+                    try {
+                        return DOMPurify.sanitize(marked.parse(text), { USE_PROFILES: { html: true } });
+                    } catch (_) {
+                        return escapeText(text);
+                    }
                 };
+
+                const formatConfigValue = (value) =>
+                    value !== null && typeof value === 'object' ? JSON.stringify(value) : value;
 
                 const autoResize = () => {
                     const el = inputRef.value;
@@ -316,6 +546,11 @@
 
                 const sendMessage = async () => {
                     if (!inputText.value.trim() || isGenerating.value) return;
+                    if (!apiKey.value.trim()) {
+                        authStatus.value = 'required';
+                        activeTab.value = 'config';
+                        return;
+                    }
 
                     const query = inputText.value;
                     inputText.value = '';
@@ -330,25 +565,37 @@
                     isGenerating.value = true;
                     abortController = new AbortController();
 
+                    const payload = {
+                        messages: [
+                            ...(systemPrompt.value.trim()
+                                ? [{ role: 'system', content: systemPrompt.value.trim() }]
+                                : []),
+                            ...messages.value.slice(0, -1).map(m => ({ role: m.role, content: m.content })),
+                        ],
+                        stream: true
+                    };
+                    if (selectedModel.value && selectedModel.value !== 'auto') {
+                        payload.model = selectedModel.value;
+                    }
+
                     try {
                         const response = await fetch('/v1/chat/completions', {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                model: 'deepseek-v4-flash',
-                                messages: [
-                                    ...(systemPrompt.value.trim()
-                                        ? [{ role: 'system', content: systemPrompt.value.trim() }]
-                                        : []),
-                                    ...messages.value.slice(0, -1).map(m => ({ role: m.role, content: m.content })),
-                                ],
-                                stream: true
-                            }),
+                            headers: {
+                                'Content-Type': 'application/json',
+                                ...authHeaders()
+                            },
+                            body: JSON.stringify(payload),
                             signal: abortController.signal
                         });
 
                         if (!response.ok) {
+                            if (response.status === 401) {
+                                markUnauthorized();
+                                throw new Error('API Key 无效，请到配置页重新输入 (401)');
+                            }
                             if (response.status === 429) throw new Error('TPM 超限，请稍后重试 (429)');
+                            if (response.status === 413) throw new Error('Prompt 超出模型上下文上限 (413)');
                             throw new Error(`HTTP 异常 ${response.status}`);
                         }
 
@@ -412,8 +659,11 @@
                 return {
                     inputText, messages, isGenerating, messagesEnd, inputRef,
                     systemPrompt, systemPromptOpen, healthStatus,
-                    renderMarkdown, autoResize, handleKeydown,
-                    sendMessage, stopGenerating, clearMessages,
+                    activeTab, tabs, models, selectedModel,
+                    depComponents, depsStatus, depsLoading, gatewayInfo,
+                    apiKey, apiKeyStored, authStatus, saveApiKey, clearApiKey,
+                    renderMarkdown, formatConfigValue, autoResize, handleKeydown,
+                    sendMessage, stopGenerating, clearMessages, refreshDeps,
                 };
             }
         }).mount('#app');

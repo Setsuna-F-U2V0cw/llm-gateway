@@ -5,15 +5,18 @@
 -- ARGV[1]: 本次请求预扣的 Token 数（预估值）
 -- ARGV[2]: 令牌桶容量上限（max_tokens）
 -- ARGV[3]: 每秒补充的 Token 数（refill_rate = TPM / 60）
--- ARGV[4]: 当前时间戳（秒）
+-- ARGV[4]: key TTL（秒）。须大于读超时，避免长 SSE 期间 key 先过期
 -- 返回值:  1 = 允许通过；0 = 触发限流
+--
+-- 时钟用 Redis TIME，禁止 JVM Instant：多实例时钟偏差会让 refill 少补或跳跃。
 -- =====================================================================
 
 local key        = KEYS[1]
 local cost       = tonumber(ARGV[1])
 local capacity   = tonumber(ARGV[2])
 local refillRate = tonumber(ARGV[3])
-local now        = tonumber(ARGV[4])
+local ttl        = tonumber(ARGV[4])
+local now        = tonumber(redis.call("TIME")[1])
 
 -- 读取桶当前状态：{tokens, last_refill_time}
 local bucket = redis.call("HMGET", key, "tokens", "last_refill_time")
@@ -35,12 +38,12 @@ tokens = math.min(capacity, tokens + refilled)
 if tokens < cost then
     -- 令牌不足，拒绝请求，但仍更新时间戳（让补充继续计算）
     redis.call("HMSET", key, "tokens", tokens, "last_refill_time", now)
-    redis.call("EXPIRE", key, 120)
+    redis.call("EXPIRE", key, ttl)
     return 0
 end
 
 -- 预扣令牌
 tokens = tokens - cost
 redis.call("HMSET", key, "tokens", tokens, "last_refill_time", now)
-redis.call("EXPIRE", key, 120)
+redis.call("EXPIRE", key, ttl)
 return 1

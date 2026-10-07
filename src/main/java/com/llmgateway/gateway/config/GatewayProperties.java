@@ -31,10 +31,7 @@ public class GatewayProperties {
      */
     private Map<String, String> routing;
 
-    /**
-     * Fallback 通道配置：主通道 TTFT 超时 / 熔断 / 下游错误时切到此处。
-     * 指向本地 Ollama OpenAI 兼容端点（qwen3-1-7b），不包 breaker，双重失败发 SSE 错误帧。
-     */
+    /** Fallback 通道配置：必须与主通道使用不同目标实例或提供商。 */
     private FallbackConfig fallback = new FallbackConfig();
 
     /**
@@ -80,6 +77,35 @@ public class GatewayProperties {
     /** 每秒补充的 Token 数（= tpmCapacity / 60） */
     private int tpmRefillRatePerSecond = 1667;
 
+    /**
+     * 令牌桶 Redis key TTL（秒）。0 表示按 {@code max(120, readTimeoutMs/1000 + 60)} 自动计算，
+     * 保证长 SSE 结束前 key 仍在，settle 能补账。
+     */
+    private int tpmBucketTtlSeconds = 0;
+
+    // ==========================================
+    // WebClient 连接池（主链路 SSE vs Embedding 隔离）
+    // ==========================================
+
+    /** 主链路（LLM SSE）出站连接池上限 */
+    private int webClientMaxConnections = 4000;
+
+    /** 主链路 pending acquire 上限 */
+    private int webClientPendingAcquireMaxCount = 8000;
+
+    /** Embedding / 健康检查用的独立小池 */
+    private int ollamaWebClientMaxConnections = 200;
+
+    /**
+     * 解析实际写入 Redis EXPIRE 的 TTL。显式配置优先；否则大于读超时，避免流未结束 key 先过期。
+     */
+    public int resolveTpmBucketTtlSeconds() {
+        if (tpmBucketTtlSeconds > 0) {
+            return tpmBucketTtlSeconds;
+        }
+        return Math.max(120, readTimeoutMs / 1000 + 60);
+    }
+
     // ==========================================
     // 语义缓存配置
     // ==========================================
@@ -90,6 +116,11 @@ public class GatewayProperties {
     private int embeddingDimension = 1024;
     private float semanticCacheThreshold = 0.95f;
     private long streamSimulateDelayMs = 20L;
+    /**
+     * 语义缓存有效期（秒）。检索 must-filter {@code created_at >= now - ttl}。
+     * 0 关闭过期过滤（仍写入 created_at，便于日后打开 TTL）。
+     */
+    private int semanticCacheTtlSeconds = 86400;
 
     // ==========================================
     // Embedding 模型配置（Ollama 本地部署）
@@ -98,6 +129,12 @@ public class GatewayProperties {
     private String ollamaBaseUrl = "http://localhost:11434";
     private String ollamaEmbedModel = "bge-m3";
     private int ollamaReadTimeoutMs = 30000;
+    /**
+     * 主链路顶部 embedding 超时（毫秒）。超时与 HTTP 错误一律 fail-open（规则分类 + 透传）。
+     * EmbeddingService 本身仍向上抛错，由 {@code embedForPipeline} 统一吞掉。
+     */
+    private long embedPipelineTimeoutMs = 3000L;
+    private PrototypeRetryConfig prototypeRetry = new PrototypeRetryConfig();
 
     // ==========================================
     // 静态内部配置类
@@ -126,12 +163,21 @@ public class GatewayProperties {
     /** Fallback 通道配置 */
     @Data
     public static class FallbackConfig {
-        private String targetUrl = "http://localhost:11434";
+        /** 默认指向第二个独立 Ollama 实例；生产建议通过环境变量改为不同提供商。 */
+        private String targetUrl = "http://localhost:11435";
         /** 模型注册表 key（用于查找路由/熔断器） */
         private String model = "qwen3-1-7b";
         /** 发送给 API 的实际 model name；为 null 时用 model */
         private String requestModel = "qwen3:1.7b";
         private String apiKey = "ollama";
+    }
+
+    /** 意图原型后台加载重试参数 */
+    @Data
+    public static class PrototypeRetryConfig {
+        private long initialDelayMs = 1000L;
+        private long maxDelayMs = 30000L;
+        private double jitter = 0.2;
     }
 
     /** Resilience4j CircuitBreaker 滑动窗口参数 */

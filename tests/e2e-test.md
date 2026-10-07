@@ -1,7 +1,7 @@
 # LLM Gateway 端到端测试命令
 
-> 更新时间：2026-07-12
-> 前置条件：Java 21, Maven, Docker, Ollama（bge-m3）, DeepSeek API Key
+> 更新时间：2026-09-21
+> 前置条件：Java 21, Maven, Docker, Ollama（bge-m3）, Gateway API Key, DeepSeek API Key
 
 ---
 
@@ -22,13 +22,81 @@ curl -X DELETE http://localhost:6333/collections/llm_cache
 # 预期: {"result":true,"status":"ok","time":0.0}
 
 # 4. 启动网关
-LLM_API_KEY=你的DeepSeek_API_Key mvn spring-boot:run
+GATEWAY_DEMO_API_KEY=demo-secret \
+LLM_API_KEY=你的DeepSeek_API_Key \
+mvn spring-boot:run
+
+# 后续受保护端点统一使用
+AUTH_HEADER='Authorization: Bearer demo-secret'
 
 # 启动时日志关键确认:
 #   - VectorStoreService.initCollection 以 size=N（当前 1024）创建 collection
 #   - 监听在 8080 端口
 #   - QdrantClient 连接成功
 ```
+
+### 存活 / 诊断 / 模型列表
+
+```bash
+curl -s http://localhost:8080/v1/health
+# 预期: LLM Gateway is running
+
+curl -s -H "$AUTH_HEADER" http://localhost:8080/v1/health/deps
+# 预期: {"status":"up"|"degraded","components":[{"name":"redis",...},{"name":"qdrant",...},{"name":"ollama",...}],"gateway":{...}}
+# HTTP 始终 200；某个依赖挂了 status=degraded，detail 带错误信息
+
+curl -s -H "$AUTH_HEADER" http://localhost:8080/v1/models
+# 预期: {"object":"list","data":[{"id":"deepseek-v4-flash","owned_by":"llm-gateway","is_thinking":false,...},...]}
+# data[].id 可直接作为 POST /v1/chat/completions 的 model；不传或 "auto" 则意图路由
+# deepseek-v4-flash-thinking / deepseek-v4-pro 的 is_thinking 必须为 true
+
+# 待办 1/3/4 回归：响应体前/缓存回放取消结算、collection missing 判 degraded、thinking YAML 绑定
+mvn -q -Dtest=GatewayPropertiesBindingTest,LlmProxyServiceTest,HealthServiceTest,IntentClassifierTest,GatewayAuthenticationFilterTest test
+
+# 全量单元测试（mock Redis/Qdrant/LLM，无需 docker）。报告见 docs/test-report.md，Jacoco HTML 在 target/site/jacoco/index.html
+mvn test
+```
+
+### API Key 鉴权
+
+```bash
+# liveness 公开
+curl -i http://localhost:8080/v1/health
+
+# 受保护端点缺 Key / 错 Key → 401 + OpenAI 风格 JSON
+curl -i http://localhost:8080/v1/models
+curl -i -H 'Authorization: Bearer wrong-key' http://localhost:8080/v1/models
+
+# 正确 Key → 200；X-User-Id 即使伪造也不会改变 Key 对应的 tenantId
+curl -i -H "$AUTH_HEADER" -H 'X-User-Id: forged-tenant' http://localhost:8080/v1/models
+```
+
+### 意图原型自愈
+
+```bash
+# 1) 先停 Ollama 再启动网关；网关应正常启动，请求走规则 fallback
+# 2) 查看 gateway.intentClassifier.state，预期 loading/retrying
+curl -s -H "$AUTH_HEADER" http://localhost:8080/v1/health/deps | python3 -m json.tool
+
+# 3) 启动 Ollama 后无需重启网关；最多等待 max-delay-ms 后再次查看
+ollama serve
+curl -s -H "$AUTH_HEADER" http://localhost:8080/v1/health/deps | python3 -m json.tool
+# 预期: gateway.intentClassifier.state=ready, loaded=6
+```
+
+### Micrometer / Prometheus
+
+```bash
+# 未鉴权不可抓取
+curl -i http://localhost:8080/actuator/prometheus
+# 预期 401
+
+# 正确 Key 返回 Prometheus 文本
+curl -s -H "$AUTH_HEADER" http://localhost:8080/actuator/prometheus | \
+  grep -E 'llm_gateway_(sse_active|ttft|cache_requests|fallback|rate_limit|tokens|requests)'
+```
+
+先发一条聊天请求再抓取，至少应出现 `llm_gateway_requests_total`、缓存 hit/miss、限流 allowed；触发主通道失败后应出现 fallback attempts/results。所有 tag 只能是有限的 model/channel/outcome/reason，禁止出现 tenantId、prompt 或异常消息。
 
 ---
 
@@ -60,8 +128,8 @@ LLM_API_KEY=你的DeepSeek_API_Key mvn spring-boot:run
 ```bash
 curl -i -N -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -H 'X-User-Id: test-user' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"用一句话介绍 Java"}],"stream":true}'
+  -H "$AUTH_HEADER" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"用一句话介绍 Java"}],"stream":true}'
 ```
 
 | 检查点 | 期望 | 排查 |
@@ -73,28 +141,33 @@ curl -i -N -X POST http://localhost:8080/v1/chat/completions \
 | 响应头 | `X-Cache-Hit: true/false` | §3 契约 |
 | 无 buffer | 输出逐字到达 | `--no-buffer` 或 `-N` |
 
-### 测试 1.2：错误 chunk 格式
+### 测试 1.2：主通道失败后的 SSE 错误 / fallback
+
+Stage 4 之后，下游 4xx/连接失败若发生在**首内容帧之前**，会先切 fallback，不一定立刻出错误帧。
 
 ```bash
-# 用错误 API Key 触发下游 401
+# 双重失败：主通道不可达且 fallback 也未启动 → HTTP 200 + 错误帧（网关不 500）
+# 可临时把 models.deepseek-v4-flash.target-url 和 FALLBACK_TARGET_URL 都指到不可达地址
 curl -i -N -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -H 'X-User-Id: test-user' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"你好"}],"stream":true}'
+  -H "$AUTH_HEADER" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
 | 检查点 | 期望 |
 |--------|------|
 | 状态码 | `200 OK`（网关不因下游错而 500） |
-| SSE body | `data: {"error": "..."}\n\n`（错误包装在 SSE 帧内） |
-| 末尾 | `data: [DONE]\n\n` |
+| 仅主通道失败、fallback 可用 | 日志 `切 fallback`，SSE 来自备用通道（下游通常自带 `[DONE]`） |
+| 双重失败 | `data:{"error":"主通道与备用通道均不可用: ..."}\n\n` 后流 **complete** |
+| 网关错误帧收尾 | **不**再补 `[DONE]`；前端以 `parsed.error` 终止 |
 
 ### 测试 1.3：非流式请求被强制转流式
 
 ```bash
 curl -i -N -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"你好"}],"stream":false}'
+  -H "$AUTH_HEADER" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"你好"}],"stream":false}'
 ```
 
 | 检查点 | 期望 |
@@ -128,8 +201,8 @@ for i in $(seq 1 5); do
   (curl -s -o /dev/null -w "Request $i: %{http_code} | X-Cache-Hit: %{header{X-Cache-Hit}}\n" \
     -X POST http://localhost:8080/v1/chat/completions \
     -H 'Content-Type: application/json' \
-    -H 'X-User-Id: limiter-test' \
-    -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"请你介绍一下JavaScript编程语言"}],"stream":true}'
+    -H "$AUTH_HEADER" \
+    -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"请你介绍一下JavaScript编程语言"}],"stream":true}'
   ) &
 done
 wait
@@ -153,16 +226,29 @@ docker exec llm-gateway-redis redis-cli FLUSHALL
 
 ### 测试 2.2：多租户隔离
 
+先临时把 `llm.gateway.auth.api-keys` 配为两个租户并重启：
+
+```yaml
+api-keys:
+  user-a: ${GATEWAY_USER_A_KEY:}
+  user-b: ${GATEWAY_USER_B_KEY:}
+```
+
+```bash
+GATEWAY_USER_A_KEY=user-a-secret GATEWAY_USER_B_KEY=user-b-secret \
+LLM_API_KEY=你的DeepSeek_API_Key mvn spring-boot:run
+```
+
 ```bash
 for i in $(seq 1 5); do
-  echo "user-a: $(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/v1/chat/completions -H 'X-User-Id: user-a' -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}')"
-  echo "user-b: $(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/v1/chat/completions -H 'X-User-Id: user-b' -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}')"
+  echo "user-a: $(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/v1/chat/completions -H 'Authorization: Bearer user-a-secret' -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}')"
+  echo "user-b: $(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/v1/chat/completions -H 'Authorization: Bearer user-b-secret' -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}')"
 done
 ```
 
 | 检查点 | 期望 |
 |--------|------|
-| user-a 超限时 | user-b 仍正常（令牌桶 key 按 X-User-Id 隔离） |
+| user-a 超限时 | user-b 仍正常（令牌桶 key 按认证 Key 映射出的 tenantId 隔离） |
 
 ### 测试 2.3：Redis fail-open
 
@@ -171,7 +257,8 @@ done
 docker stop llm-gateway-redis
 curl -i -N -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"你好"}],"stream":true}'
+  -H "$AUTH_HEADER" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
 | 检查点 | 期望 |
@@ -193,8 +280,8 @@ docker start llm-gateway-redis  # 恢复
 ```bash
 curl -i -N -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -H 'X-User-Id: cache-test' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"用一句话介绍 Java"}],"stream":true}'
+  -H "$AUTH_HEADER" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"用一句话介绍 Java"}],"stream":true}'
 ```
 
 | 检查点 | 期望 | 日志关键字 |
@@ -209,8 +296,8 @@ curl -i -N -X POST http://localhost:8080/v1/chat/completions \
 # 重复完全相同请求
 curl -i -N -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -H 'X-User-Id: cache-test' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"用一句话介绍 Java"}],"stream":true}'
+  -H "$AUTH_HEADER" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"用一句话介绍 Java"}],"stream":true}'
 ```
 
 | 检查点 | 期望 | 日志关键字 |
@@ -225,8 +312,8 @@ curl -i -N -X POST http://localhost:8080/v1/chat/completions \
 ```bash
 curl -i -N -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -H 'X-User-Id: cache-test' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"请用一句话简单介绍一下 Java 编程语言"}],"stream":true}'
+  -H "$AUTH_HEADER" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"请用一句话简单介绍一下 Java 编程语言"}],"stream":true}'
 ```
 
 | 检查点 | 期望 |
@@ -235,6 +322,41 @@ curl -i -N -X POST http://localhost:8080/v1/chat/completions \
 
 > 阈值 0.95 较严，验证可临时降到 `semantic-cache-threshold: 0.85` 观察。
 
+### 测试 3.6：缓存租户隔离（同 prompt、不同租户 API Key）
+
+沿用测试 2.2 的双租户 Key 配置。Qdrant 用 docker-compose 即可，**不必重建 collection**。升级后旧点没有 `tenant_id`/`model` payload，会被 filter 排除（看起来像缓存冷启动），新写入会带上这两个字段。
+
+```bash
+# 1) user-a 未命中并落库
+curl -s -o /dev/null -D - -N -X POST http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer user-a-secret' \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"用一句话介绍 Java"}],"stream":true}' \
+  | tr -d '\r' | grep -i x-cache-hit
+
+# 2) user-a 再发 → 命中
+curl -s -o /dev/null -D - -N -X POST http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer user-a-secret' \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"用一句话介绍 Java"}],"stream":true}' \
+  | tr -d '\r' | grep -i x-cache-hit
+
+# 3) user-b 同 prompt → 未命中（租户隔离）
+curl -s -o /dev/null -D - -N -X POST http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer user-b-secret' \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"用一句话介绍 Java"}],"stream":true}' \
+  | tr -d '\r' | grep -i x-cache-hit
+```
+
+| 检查点 | 期望 |
+|--------|------|
+| 第 1 次 user-a | `X-Cache-Hit: false` |
+| 第 2 次 user-a | `X-Cache-Hit: true` |
+| user-b 同 prompt | `X-Cache-Hit: false` |
+
+日志关键字：`语义缓存命中: tenant=user-a`；user-b 侧 `语义缓存未命中: tenant=user-b`。
+
 ### 测试 3.4：Embedding fail-open
 
 ```bash
@@ -242,16 +364,20 @@ curl -i -N -X POST http://localhost:8080/v1/chat/completions \
 pkill -f "ollama serve"
 curl -i -N -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"讲一个故事"}],"stream":true}'
+  -H "$AUTH_HEADER" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"讲一个故事"}],"stream":true}'
 # 日志: "Ollama Embedding 调用失败，缓存将降级为未命中透传"
 # 仍正常流式输出（fail-open，不阻断主链路）
 ```
 
 ### 测试 3.5：清空缓存
 
+租户隔离**不需要**删 collection（payload 加字段、维度不变）。只有 embedding 维度变化时才必须重建。
+
 ```bash
 # 删除 Qdrant collection（重启网关自动重建）
 curl -X DELETE http://localhost:6333/collections/llm_cache
+# 或：docker exec llm-gateway-qdrant curl -X DELETE http://localhost:6333/collections/llm_cache
 # 重启网关后 initCollection 自动重建
 ```
 
@@ -259,7 +385,7 @@ curl -X DELETE http://localhost:6333/collections/llm_cache
 
 ## Stage 4：熔断与智能路由
 
-> 前置：`ollama pull qwen3:1.7b`（fallback chat 模型）+ 已有 `bge-m3`（embedding）。启动网关 `LLM_API_KEY=xxx mvn spring-boot:run`。
+> 前置：主 Ollama `11434` 用于 embedding/可选主路由；另启独立 fallback 实例：`OLLAMA_HOST=127.0.0.1:11435 ollama serve`。也可用 `FALLBACK_*` 配置不同云提供商。
 
 ### 测试 4.1：TTFT 熔断 + Fallback 切换
 
@@ -275,34 +401,35 @@ curl -X DELETE http://localhost:6333/collections/llm_cache
          ├ breaker open → CallNotPermitted ┤
          └ 下游错误 ──────────────────────┘
                                           ↓
-              .onErrorResume → fallback（Ollama qwen3:1.7b，首内容前才切）
+              .onErrorResume → 差异 fallback（默认 Ollama 11435，首内容前才切）
                  ├ 成功 → SSE 透传 qwen3:1.7b 输出
                  └ 也挂 → data:{"error":"主通道与备用通道均不可用"}
 ```
 
 ```bash
-# 1. 临时把 deepseek-chat 指向不可达地址（模拟主通道挂）
-#    编辑 application.yml: models.deepseek-chat.target-url: http://10.255.255.1
+# 1. 临时把 deepseek-v4-flash 指向不可达地址（模拟主通道挂）
+#    编辑 application.yml: models.deepseek-v4-flash.target-url: http://10.255.255.1
 #    重启网关
 
 # 2. 发请求：3s 内首 token 到不了 → 切 fallback qwen3:1.7b，仍返回完整 SSE 流
 curl -i -N -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -H 'X-User-Id: ttft-test' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"用一句话介绍 Java"}],"stream":true}'
+  -H "$AUTH_HEADER" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"用一句话介绍 Java"}],"stream":true}'
 
 # 预期：
 #   - 约 3s 后开始收到 SSE 流（fallback qwen3:1.7b 的输出，不是 DeepSeek）
 #   - 日志: "主通道失败，切 fallback: reason=TimeoutException"
-#   - Content-Type: text/event-stream;charset=UTF-8，SSE 格式正确，data:[DONE] 收尾
+#   - Content-Type: text/event-stream；fallback 成功时下游通常自带 data:[DONE]
+#   - 双重失败时只有 error 帧，网关不补 [DONE]
 
 # 3. 连发多次（> minimum-number-of-calls=20）触发熔断器 open
 for i in $(seq 1 25); do
   curl -s -o /dev/null -w "Request $i: %{http_code}\n" -X POST http://localhost:8080/v1/chat/completions \
-    -H 'Content-Type: application/json' -H 'X-User-Id: ttft-test' \
+    -H 'Content-Type: application/json' -H "$AUTH_HEADER" \
     -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
 done
-# 预期：后期请求日志出现 "CircuitBreaker 'deepseek-chat' is OPEN" → 直接走 fallback，不再等 3s
+# 预期：后期请求日志出现 breaker open → 直接走 fallback，不再等 3s
 ```
 
 | 检查点 | 期望 |
@@ -311,34 +438,37 @@ done
 | 持续失败 | 熔断器 open，后续请求跳过 3s 等待直接 fallback |
 | 双重失败 | fallback 也挂时 → `data: {"error":"主通道与备用通道均不可用: ..."}` |
 
-> 验证完改回 `models.deepseek-chat.target-url: https://api.deepseek.com`。
+> 验证完改回 `models.deepseek-v4-flash.target-url: https://api.deepseek.com`。
 
 ### 测试 4.2：Fallback 转发（主通道正常 + 主动触发）
 
 ```bash
-# 主通道正常时，发请求应走 deepseek-chat（不经 fallback）
+# 主通道正常时，发请求应走 deepseek-v4-flash（不经 fallback）
 curl -i -N -X POST http://localhost:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' -H 'X-User-Id: fb-test' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"你好"}],"stream":true}'
-# 日志: "路由决策: intent=..., model=deepseek-chat" → 走主通道，无 "切 fallback" 日志
+  -H 'Content-Type: application/json' -H "$AUTH_HEADER" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"你好"}],"stream":true}'
+# 日志: "explicitModel=deepseek-v4-flash" → 走主通道，无 "切 fallback" 日志
 
 # 触发 fallback：见 4.1 的不可达地址法；或临时把 ttft-slo-ms 调到 1（极严）让正常延迟也超时
 ```
 
 | 检查点 | 期望 |
 |--------|------|
-| 主通道正常 | 走 deepseek-chat，X-Cache-Hit: false（未命中缓存时） |
+| 主通道正常 | 走 deepseek-v4-flash，X-Cache-Hit: false（未命中缓存时） |
 | Fallback 切换 | SSE 内容来自 qwen3:1.7b，流式正常 |
+
+把 fallback 临时配置为与 qwen 主通道完全相同的 `11434 + qwen3:1.7b`，再显式请求 `qwen3-1-7b`，应直接得到“fallback 配置与主通道相同”错误帧，且不重复调用同一实例。
 
 ### 测试 3.4 复用：Embedding fail-open（思考模型路由验证）
 
 ```bash
-# 思考模型路由：发"证明素数无限"应路由到 deepseek-reasoner（reasoning 意图）
+# 不传 model（或 "auto"）才走意图分类。传已注册 id 会跳过分类。
+# 推理意图 → deepseek-v4-flash-thinking
 curl -i -N -X POST http://localhost:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' -H 'X-User-Id: route-test' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"证明素数有无限多个"}],"stream":true}'
-# 日志: "路由决策: intent=REASONING, model=deepseek-reasoner"
-# 前端: 🧠 推理过程块（置灰斜体）+ 正文气泡
+  -H 'Content-Type: application/json' -H "$AUTH_HEADER" \
+  -d '{"messages":[{"role":"user","content":"证明素数有无限多个"}],"stream":true}'
+# 日志: "路由决策: intent=REASONING, model=deepseek-v4-flash-thinking"
+# 前端: 推理过程块（置灰斜体）+ 正文气泡
 ```
 
 ### 测试 4.3：策略模式路由
@@ -348,53 +478,54 @@ curl -i -N -X POST http://localhost:8080/v1/chat/completions \
 > 💡 跑此测试前建议先清一次缓存（测试 3.5），避免缓存命中短路跳过路由决策日志。
 
 ```bash
-# ---------- 代码意图 → deepseek-chat ----------
+# 验证意图路由时不要传已注册 model，否则会 skip 分类。
+# ---------- 代码意图 → deepseek-v4-flash ----------
 curl -s -N -X POST http://localhost:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' -H 'X-User-Id: route-test' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"用 Python 写一个快排"}],"stream":true}' > /dev/null
-# 网关日志: "路由决策: intent=CODE, model=deepseek-chat"
+  -H 'Content-Type: application/json' -H "$AUTH_HEADER" \
+  -d '{"messages":[{"role":"user","content":"用 Python 写一个快排"}],"stream":true}' > /dev/null
+# 网关日志: "路由决策: intent=CODE, model=deepseek-v4-flash"
 
-# ---------- 推理意图 → deepseek-reasoner（思考模型）----------
+# ---------- 推理意图 → deepseek-v4-flash-thinking ----------
 curl -s -N -X POST http://localhost:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' -H 'X-User-Id: route-test' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"证明素数有无限多个"}],"stream":true}' > /dev/null
-# 网关日志: "路由决策: intent=REASONING, model=deepseek-reasoner"
-# 浏览器前端: 🧠 推理过程块（置灰斜体）+ 正文气泡
+  -H 'Content-Type: application/json' -H "$AUTH_HEADER" \
+  -d '{"messages":[{"role":"user","content":"证明素数有无限多个"}],"stream":true}' > /dev/null
+# 网关日志: "路由决策: intent=REASONING, model=deepseek-v4-flash-thinking"
+# 浏览器前端: 推理过程块（置灰斜体）+ 正文气泡
 
-# ---------- 闲聊意图 → qwen3:1.7b（本地省钱）----------
+# ---------- 闲聊意图 → qwen3-1-7b（本地省钱；下游 tag 为 qwen3:1.7b）----------
 curl -s -N -X POST http://localhost:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' -H 'X-User-Id: route-test' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"今天天气怎么样"}],"stream":true}' > /dev/null
-# 网关日志: "路由决策: intent=CHITCHAT, model=qwen3:1.7b"
+  -H 'Content-Type: application/json' -H "$AUTH_HEADER" \
+  -d '{"messages":[{"role":"user","content":"今天天气怎么样"}],"stream":true}' > /dev/null
+# 网关日志: "路由决策: intent=CHITCHAT, model=qwen3-1-7b"
 
-# ---------- 数学意图 → deepseek-reasoner ----------
+# ---------- 数学意图 → deepseek-v4-pro ----------
 curl -s -N -X POST http://localhost:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' -H 'X-User-Id: route-test' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"计算 ∫x²dx 从 0 到 1"}],"stream":true}' > /dev/null
-# 网关日志: "路由决策: intent=MATH, model=deepseek-reasoner"
+  -H 'Content-Type: application/json' -H "$AUTH_HEADER" \
+  -d '{"messages":[{"role":"user","content":"计算 ∫x²dx 从 0 到 1"}],"stream":true}' > /dev/null
+# 网关日志: "路由决策: intent=MATH, model=deepseek-v4-pro"
 
 # ---------- 超长 prompt 守卫 ----------
-# 构造超过 model 上限的 prompt（deepseek-chat maxContext=64000）
-# 可用脚本生成长文本：
+# LengthGuard 按 input token（countInputTokens）对 maxContext，不是 TPM 的 estimateTotalTokens（约 input×2.5）。
+# 中等超长（input 超过 flash 64000、仍低于 pro 128000）→ 日志 LengthGuard 覆盖，HTTP 200。
+# 超过所有 maxContext（pro=128000）→ HTTP 413，不会开始 SSE。
 python3 -c "
 import json
-text = '你好 ' * 50000
-req = json.dumps({'model':'deepseek-chat','messages':[{'role':'user','content':text}],'stream':true})
+text = '你好 ' * 200000
+req = json.dumps({'model':'deepseek-v4-flash','messages':[{'role':'user','content':text}],'stream':true})
 print(req)
 " | curl -i -N -X POST http://localhost:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' -H 'X-User-Id: route-test' -d @-
-# 预期: HTTP 413 REQUESTED_RANGE_NOT_SATISFIABLE
-# 如果 llm.gateway.xlong-threshold 生效且存在 big-context model，
-# 日志会显示 "LengthGuard 覆盖: ... → ... (tokenCount=... 超上限)"
+  -H 'Content-Type: application/json' -H "$AUTH_HEADER" -d @-
+# 预期: HTTP 413 REQUESTED_RANGE_NOT_SATISFIABLE（写头之前拒绝）
+# 若只想看覆盖：把重复次数降到使 input token 落在 (64000, 128000] 之间
 ```
 
 | 检查点 | 期望 | 关键日志 |
 |--------|------|----------|
-| 代码意图 | model=deepseek-chat | `路由决策: intent=CODE, model=deepseek-chat` |
-| 推理意图 | model=deepseek-reasoner，前端显示 🧠 推理块 | `路由决策: intent=REASONING, model=deepseek-reasoner` |
-| 闲聊意图 | model=qwen3:1.7b（本地省钱） | `路由决策: intent=CHITCHAT, model=qwen3:1.7b` |
-| 数学意图 | model=deepseek-reasoner | `路由决策: intent=MATH, model=deepseek-reasoner` |
-| 超长 prompt | HTTP 413 或 xlong 覆盖 | `LengthGuard 覆盖` 或 `413` |
+| 代码意图 | model=deepseek-v4-flash | `路由决策: intent=CODE, model=deepseek-v4-flash` |
+| 推理意图 | model=deepseek-v4-flash-thinking，前端推理块 | `路由决策: intent=REASONING, model=deepseek-v4-flash-thinking` |
+| 闲聊意图 | model=qwen3-1-7b（本地省钱） | `路由决策: intent=CHITCHAT, model=qwen3-1-7b` |
+| 数学意图 | model=deepseek-v4-pro | `路由决策: intent=MATH, model=deepseek-v4-pro` |
+| 超长 prompt | HTTP **413**，或覆盖后 200 | `LengthGuard 覆盖` 或状态码 413 |
 | 缓存命中（复用 3.2） | 不路由，日志无"路由决策" | 只有 `语义缓存命中，伪装 SSE 流输出` |
 
 > 注：意图分类复用 embedding（缓存检索的副产物）。若 Ollama embedding 不可用，退化为规则分类（关键词匹配），日志仍可见 intent 判定。
@@ -406,7 +537,7 @@ print(req)
 | 测试 | 关键检查点 | 通过标准 |
 |------|-----------|---------|
 | **1.1 基础 SSE 透传** | SSE 流输出 + `[DONE]` | 逐字到达，末尾终止符，`X-Cache-Hit: false` |
-| **1.2 错误 chunk** | 下游 401 不导致网关 500 | SSE 错误帧 `data: {"error":"..."}` + `[DONE]` |
+| **1.2 主通道失败** | 不导致网关 500 | fallback 成功透传，或错误帧且无额外 `[DONE]` |
 | **1.3 强制流式** | `stream:false` 仍返回 SSE | 和 1.1 一样是流式响应 |
 | **2.1 基础限流** | 并发 5 发，容量 120 | 恰好 2 个 200、3 个 429 |
 | **2.2 多租户隔离** | user-a 超限不影响 user-b | 隔离子桶独立计数 |
@@ -419,11 +550,11 @@ print(req)
 | **4.1 熔断器 open** | 连发 25 次，后期跳过 3s 等待 | 日志 `CircuitBreaker '...' is OPEN` |
 | **4.1 双重失败** | fallback 也挂 | `data: {"error":"主通道与备用通道均不可用: ..."}` |
 | **4.2 Fallback 转发** | 主通道正常时不走 fallback | 日志无 `切 fallback` |
-| **4.3 代码意图** | → `deepseek-chat` | 日志 `intent=CODE` |
-| **4.3 推理意图** | → `deepseek-reasoner` | 日志 `intent=REASONING`，前端 🧠 推理块 |
-| **4.3 闲聊意图** | → `qwen3:1.7b`（本地省钱） | 日志 `intent=CHITCHAT` |
-| **4.3 数学意图** | → `deepseek-reasoner` | 日志 `intent=MATH` |
-| **4.3 超长 prompt** | → HTTP 413 或 xlong 覆盖 | `LengthGuard 覆盖` 日志或 `413` |
+| **4.3 代码意图** | → `deepseek-v4-flash` | 日志 `intent=CODE`（请求不传 model） |
+| **4.3 推理意图** | → `deepseek-v4-flash-thinking` | 日志 `intent=REASONING`，前端推理块 |
+| **4.3 闲聊意图** | → `qwen3-1-7b`（本地省钱） | 日志 `intent=CHITCHAT` |
+| **4.3 数学意图** | → `deepseek-v4-pro` | 日志 `intent=MATH` |
+| **4.3 超长 prompt** | HTTP **413** 或 xlong 覆盖后 200 | 状态码 413 / 日志 `LengthGuard 覆盖` |
 | **3.2 + 4.3 缓存命中短路** | 命中时不管意图 | 无 `路由决策` 日志，只 `缓存命中` |
 
 ---
@@ -433,7 +564,7 @@ print(req)
 测试完 Stage 4 后确认以下配置已恢复：
 
 ```yaml
-# application.yml → models.deepseek-chat.target-url
+# application.yml → models.deepseek-v4-flash.target-url
 target-url: https://api.deepseek.com        # 不是 http://10.255.255.1
 
 # application.yml → tpm-capacity / tpm-refill-rate-per-second 已恢复
@@ -483,15 +614,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(('0.0.0.0', 11435), Handler).serve_forever()
 PYEOF
 
-# 2. 启动假下游
+# 2. 启动假下游（脚本不在仓库内，由本段 heredoc 写入 /tmp）
 python3 /tmp/fake_llm.py &
 
-# 3. application.yml 中 deepseek-chat 指向假下游
-# models.deepseek-chat.target-url: http://localhost:11435
-# ttft-slo-ms: 15000（避免 SLO 超时切到 fallback）
+# 3. application.yml 中把主模型指向假下游（注意：11435 也是默认 fallback 端口，
+#    测缓存时应把 FALLBACK_TARGET_URL 指到别处，或把 ttft-slo-ms 调到 15000 避免误切）
+# models.deepseek-v4-flash.target-url: http://localhost:11435
+# ttft-slo-ms: 15000
 
-# 4. 启动网关
-mvn clean spring-boot:run
+# 4. 启动网关（鉴权默认开启）
+GATEWAY_DEMO_API_KEY=demo-secret LLM_API_KEY=你的DeepSeek_API_Key \
+mvn spring-boot:run
 ```
 
 #### 测试命令
@@ -501,6 +634,7 @@ mvn clean spring-boot:run
 curl -N -s -D - -o /dev/null -w "TTFB: %{time_starttransfer}s\n" \
   -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H "$AUTH_HEADER" \
   -d '{"messages":[{"role":"user","content":"写一个二分查找"}],"stream":true}' 2>&1 | grep -E "Cache|TTFB"
 
 sleep 3
@@ -509,6 +643,7 @@ sleep 3
 curl -N -s -D - -o /dev/null -w "TTFB: %{time_starttransfer}s\n" \
   -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H "$AUTH_HEADER" \
   -d '{"messages":[{"role":"user","content":"写一个二分查找"}],"stream":true}' 2>&1 | grep -E "Cache|TTFB"
 ```
 
@@ -528,8 +663,9 @@ curl -N -s -D - -o /dev/null -w "TTFB: %{time_starttransfer}s\n" \
 **目标**：主通道正常 → 主通道宕机 → 请求全由 fallback（qwen3:1.7b）接管，成功率 100%，SSE 不中断。
 
 **前置条件**：
-- `application.yml` 中 `deepseek-chat` 和 `deepseek-reasoner` 的 `target-url` 已指向本地假下游 `http://localhost:11435`
-- `ttft-slo-ms` 足够宽松（当前 `15000`，使假下游 4-6s 首字延迟不会误触超时）
+- `application.yml` 中 `deepseek-v4-flash` / `deepseek-v4-flash-thinking` / `deepseek-v4-pro` 的 `target-url` 已指向本地假下游 `http://localhost:11435`（CODE/REASONING/MATH 都会打到假下游）
+- `ttft-slo-ms` 足够宽松（测当时 `15000`，使假下游 4-6s 首字延迟不会误触超时）
+- 独立 fallback Ollama 在 **别的端口/提供商**（默认配置 11435 会与假下游冲突，需改 `FALLBACK_TARGET_URL`）
 - Ollama 已运行，`qwen3:1.7b` 已拉取
 
 ```bash
@@ -541,13 +677,14 @@ curl -N -s -D - -o /dev/null -w "TTFB: %{time_starttransfer}s\n" \
 curl -N -s -o /dev/null -w "预热 TTFB: %{time_starttransfer}s\n" \
   -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H "$AUTH_HEADER" \
   -d '{"messages":[{"role":"user","content":"你好"}],"stream":true}' \
   --max-time 30
 
 # =================================================
 # 第 2 步：启动假下游（模拟 DeepSeek 主通道）
 # =================================================
-python3 /home/cary/.claude/jobs/0fd5fff7/tmp/fake_llm.py &
+python3 /tmp/fake_llm.py &
 sleep 2
 
 # 验证假下游存活（--max-time 需大于 6s 首字延迟 + 2s 逐字输出）
@@ -558,11 +695,12 @@ curl -s -o /dev/null -w "假下游 HTTP: %{http_code}\n" \
   --max-time 15
 
 # =================================================
-# 第 3 步：验证主通道正常（假下游代理 deepseek-chat）
+# 第 3 步：验证主通道正常（假下游代理 deepseek-v4-flash）
 # =================================================
-# prompt "写一个二分查找" → Router CODE → deepseek-chat → localhost:11435（假下游）
+# prompt "写一个二分查找" → Router CODE → deepseek-v4-flash → localhost:11435（假下游）
 curl -N -s -D - -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H "$AUTH_HEADER" \
   -d '{"messages":[{"role":"user","content":"写一个二分查找"}],"stream":true}' \
   --max-time 20 2>&1 | grep -E "X-Cache-Hit|HTTP|TTFB|假下游"
 # 预期: X-Cache-Hit: false, TTFB ≈ 5-6s（来自假下游的模拟首字延迟）
@@ -586,6 +724,7 @@ for i in $(seq 1 10); do
   curl -N -s -D - -o /dev/null -w "TTFB: %{time_starttransfer}s | HTTP: %{http_code}\n" \
     -X POST http://localhost:8080/v1/chat/completions \
     -H 'Content-Type: application/json' \
+    -H "$AUTH_HEADER" \
     -d '{"messages":[{"role":"user","content":"写一个二分查找"}],"stream":true}' \
     --max-time 30 2>&1 | grep -E "Cache|TTFB|HTTP"
   sleep 1
@@ -600,7 +739,7 @@ done
 #   - 网关日志有 "主通道失败，切 fallback: reason=..."（每条请求1次）
 #   - 网关日志无 "双重失败" / "主通道与备用通道均不可用"
 #   - 成功率 = 10/10 = 100% ✓
-#   - SSE 流完整，以 data:[DONE] 结尾
+#   - SSE 流完整；fallback 成功时下游带 [DONE]，网关错误帧不补 [DONE]
 
 # 查看网关 fallback 日志
 # Spring Boot 默认输出到终端 stdout，看启动网关的终端窗口即可
@@ -618,7 +757,7 @@ done
 | 主通道正常 | `X-Cache-Hit: false`，TTFB 5-6s（假下游首字延迟） | `-D -` 输出头 |
 | 停掉假下游 | `localhost:11435` 无监听 | `ss -tlnp` |
 | Fallback 接管 | 10/10 HTTP 200，TTFB ~1-3s（非 5-6s） | 循环输出 |
-| SSE 完整性 | `data: [DONE]` 收尾 | 网关日志无异常 |
+| SSE 完整性 | fallback 成功则下游 `[DONE]`；错误帧无额外 `[DONE]` | 对照 body |
 | 网关日志 | 10 条 `切 fallback`，无 `双重失败` | `grep "切 fallback"` |
 
 #### 测试结果（2026-07-12 实测）

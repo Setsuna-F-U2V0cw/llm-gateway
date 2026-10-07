@@ -17,10 +17,13 @@ import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.SignalType;
 
 import java.time.Duration;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * LLM 代理服务：将网关请求透传给下游 LLM，以 ResponseEntity 包装的 Flux&lt;String&gt; SSE 流返回。
@@ -41,7 +44,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *                          .onErrorResume → fallback(Ollama qwen3:1.7b)
  *                             ├ 成功 → SSE 透传
  *                             └ 也挂 → data:{"error":"主通道与备用通道均不可用"}
- *                       → doOnComplete：Token 结算 + 异步写缓存（复用顶部 embedding）
+ *                       → doFinally：Token 结算（complete/cancel/error 都结）
+ *                       → doOnComplete：异步写缓存（复用顶部 embedding；fallback 跳过）
  *
  * [💣 踩坑预警] fallback 只能在「首内容帧之前」切（Q5）。
  * 若主通道已吐 content 后中途出错，再切 fallback 会让客户端收到「半截 A + 半截 B」矛盾内容。
@@ -60,6 +64,7 @@ public class LlmProxyService {
     private final EmbeddingService embeddingService;
     private final Router router;
     private final CircuitBreakerService circuitBreakerService;
+    private final GatewayMetrics gatewayMetrics;
     private final ObjectMapper objectMapper;
 
     /**
@@ -69,29 +74,64 @@ public class LlmProxyService {
      * 决出后写入 X-Cache-Hit 响应头（前端 onopen 即可读到）。
      */
     public Mono<ResponseEntity<Flux<String>>> streamChat(ChatRequest request, String userId) {
-        request.setStream(true);
-        int estimatedTokens = tokenCountService.estimateTotalTokens(request);
-        log.debug("请求转发: userId={}, model={}, estimatedTokens={}", userId, request.getModel(), estimatedTokens);
+        return Mono.defer(() -> {
+            request.setStream(true);
+            int inputTokens = tokenCountService.countInputTokens(request);
+            int estimatedTokens = tokenCountService.estimateTotalTokens(request);
+            // 路由会改写 request.model，缓存键必须用客户端原始 model，否则读写对不上。
+            String cacheModel = request.getModel();
+            GatewayMetrics.StreamTracker tracker = gatewayMetrics.startStream();
+            log.debug("请求转发: userId={}, model={}, inputTokens={}, estimatedTokens={}",
+                    userId, cacheModel, inputTokens, estimatedTokens);
 
-        return rateLimiterService.tryAcquire(userId, estimatedTokens)
-                .flatMap(allowed -> {
-                    if (!allowed) {
-                        return Mono.<ResponseEntity<Flux<String>>>error(new ResponseStatusException(
-                                HttpStatus.TOO_MANY_REQUESTS, "TPM 超限，请稍后重试"));
-                    }
-                    // [💎 面试亮点] embed 顶部算一次，三处复用：缓存检索、意图分类、写缓存。
-                    // fail-open：embedding 不可用时返回 Optional.empty()，下游走规则分类 + 透传。
-                    String prompt = extractPrompt(request);
-                    return embedForPipeline(prompt)
-                            .flatMap(embedding -> semanticCacheService.searchCache(embedding.orElse(null), request.getModel())
-                                    .map(opt -> opt
-                                            .map(cacheFlux -> ResponseEntity.ok()
-                                                    .header("X-Cache-Hit", "true")
-                                                    .<Flux<String>>body(cacheFlux))
-                                            .orElseGet(() -> ResponseEntity.ok()
-                                                    .header("X-Cache-Hit", "false")
-                                                    .body(doStreamChat(request, userId, estimatedTokens, embedding)))));
-                });
+            return rateLimiterService.tryAcquire(userId, estimatedTokens)
+                    .flatMap(allowed -> {
+                        gatewayMetrics.recordRateLimit(allowed);
+                        if (!allowed) {
+                            return Mono.<ResponseEntity<Flux<String>>>error(new ResponseStatusException(
+                                    HttpStatus.TOO_MANY_REQUESTS, "TPM 超限，请稍后重试"));
+                        }
+                        AtomicBoolean settlementDone = new AtomicBoolean(false);
+                        // [💎 面试亮点] embed 顶部算一次，三处复用：缓存检索、意图分类、写缓存。
+                        // fail-open：embedding 不可用时返回 Optional.empty()，下游走规则分类 + 透传。
+                        String prompt = extractPrompt(request);
+                        return embedForPipeline(prompt)
+                                .flatMap(embedding -> semanticCacheService.searchCache(
+                                                embedding.orElse(null), cacheModel, userId)
+                                        .flatMap(opt -> {
+                                            gatewayMetrics.recordCacheLookup(opt.isPresent());
+                                            if (opt.isPresent()) {
+                                                return Mono.just(ResponseEntity.ok()
+                                                        .header("X-Cache-Hit", "true")
+                                                        .<Flux<String>>body(attachSettlement(
+                                                                opt.get().stream(), userId, request,
+                                                                estimatedTokens, settlementDone,
+                                                                tracker, cacheModel)));
+                                            }
+                                            // [💣 踩坑] LengthGuard 必须在写 200 之前完成。
+                                            // 若 route() 放进 body Flux，WebFlux 已发出 200 + text/event-stream，
+                                            // 413 只能变成流上的 onError，客户端看不到 HTTP 413。
+                                            return router.route(request, inputTokens, embedding.orElse(null))
+                                                    .map(route -> ResponseEntity.ok()
+                                                            .header("X-Cache-Hit", "false")
+                                                            .<Flux<String>>body(doStreamChat(
+                                                                    route, request, userId, estimatedTokens,
+                                                                    embedding, cacheModel, settlementDone,
+                                                                    tracker)));
+                                        }))
+                                // 响应体尚未交给 WebFlux 前就取消/报错时，body 的 doFinally 不会执行。
+                                .doFinally(sig -> {
+                                    if (sig != SignalType.ON_COMPLETE) {
+                                        settleOnce(settlementDone, userId, request, estimatedTokens, "");
+                                    }
+                                });
+                    })
+                    .doFinally(sig -> {
+                        if (sig != SignalType.ON_COMPLETE) {
+                            tracker.finish(cacheModel, "pre_route", outcome(sig, false));
+                        }
+                    });
+        });
     }
 
     /**
@@ -103,79 +143,138 @@ public class LlmProxyService {
         }
         return embeddingService.embed(prompt)
                 .map(Optional::of)
+                .timeout(Duration.ofMillis(props.getEmbedPipelineTimeoutMs()))
                 .onErrorResume(e -> {
-                    log.warn("Embedding 失败，降级为规则分类 + 透传: {}", e.getMessage());
+                    log.warn("Embedding 失败/超时，降级为规则分类 + 透传: {}", e.toString());
                     return Mono.just(Optional.empty());
                 });
     }
 
     /**
-     * 路由 → 主通道（带 TTFT 超时 + 熔断）→ fallback（必要时）→ 异步结算/落库
+     * 主通道（带 TTFT 超时 + 熔断）→ fallback（必要时）→ 异步结算/落库。
+     * Route 已在写 200 之前由 {@code router.route()} 决出（含 LengthGuard）。
      *
      * 用 Flux.defer 包裹，确保每次订阅拿到独立的 buf / contentStarted / servedByFallback 状态。
      */
-    private Flux<String> doStreamChat(ChatRequest request, String userId, int estimatedTokens,
-                                      Optional<float[]> embedding) {
+    private Flux<String> doStreamChat(Route route, ChatRequest request, String userId, int estimatedTokens,
+                                      Optional<float[]> embedding, String cacheModel,
+                                      AtomicBoolean settlementDone,
+                                      GatewayMetrics.StreamTracker tracker) {
         return Flux.defer(() -> {
             StringBuilder responseBuffer = new StringBuilder();
             AtomicBoolean contentStarted = new AtomicBoolean(false);
             AtomicBoolean servedByFallback = new AtomicBoolean(false);
+            AtomicBoolean terminalError = new AtomicBoolean(false);
+            AtomicReference<String> observedModel = new AtomicReference<>(route.getModel());
+            AtomicReference<String> observedChannel = new AtomicReference<>("primary");
 
-            return router.route(request, estimatedTokens, embedding.orElse(null))
-                    .flatMapMany(route -> {
-                        long slo = route.isThinking() ? props.getTtftSloThinkingMs() : props.getTtftSloMs();
-                        // [🚧 核心难点] TTFT 超时赛跑（Q6 选 B）：
-                        //   firstTimeout = Mono.delay(SLO) 订阅时启动
-                        //   perChunkProvider：有 content/reasoning → Mono.never()（解除计时，首 token 到了）
-                        //                     无 content（role 帧）→ Mono.delay(SLO)（重置计时继续等首 token）
-                        //   超时抛 TimeoutException。role 帧透传，契约完整。
-                        Flux<String> primaryWithTtft = callPrimary(route, request)
-                                .timeout(Mono.delay(Duration.ofMillis(slo)),
-                                        chunk -> hasContent(chunk)
-                                                ? Mono.<Long>never()
-                                                : Mono.delay(Duration.ofMillis(slo)));
+            long slo = route.isThinking() ? props.getTtftSloThinkingMs() : props.getTtftSloMs();
+            // [🚧 核心难点] TTFT 超时赛跑（Q6 选 B）：
+            //   firstTimeout = Mono.delay(SLO) 订阅时启动
+            //   perChunkProvider：有 content/reasoning → Mono.never()（解除计时，首 token 到了）
+            //                     无 content（role 帧）→ Mono.delay(SLO)（重置计时继续等首 token）
+            //   超时抛 TimeoutException。role 帧透传，契约完整。
+            Flux<String> primaryWithTtft = callPrimary(route, request)
+                    .doOnNext(chunk -> {
+                        if (hasContent(chunk)) {
+                            tracker.firstToken(route.getModel(), "primary");
+                        }
+                    })
+                    .timeout(Mono.delay(Duration.ofMillis(slo)),
+                            chunk -> hasContent(chunk)
+                                    ? Mono.<Long>never()
+                                    : Mono.delay(Duration.ofMillis(slo)));
 
-                        // [💎 面试亮点] TTFT-as-failure（Q7 选 A）：
-                        //   breaker.decorate 在内、onErrorResume(→fallback) 在外。
-                        //   fallback 成功救用户，但不洗白 primary 的 failure 计数——窗口统计才准。
-                        //   关掉 slow-call 判定（CircuitBreakerService 里配），TTFT 由上面的 timeout 接管。
-                        return primaryWithTtft
-                                .transform(circuitBreakerService.get(route.getModel()))
-                                .onErrorResume(e -> {
-                                    if (contentStarted.get()) {
-                                        // 首内容已吐，中途错误不能切 fallback（避免半截 A + 半截 B）→ 错误帧
-                                        log.warn("主通道中途错误（已吐内容，发错误帧不切 fallback）: {}", e.getMessage());
-                                        return Flux.just("{\"error\": \"主通道中断: " + safeMsg(e) + "\"}");
-                                    }
-                                    // 首内容前失败（TTFT 超时 / breaker open / 早期错误）→ 切 fallback
-                                    log.info("主通道失败，切 fallback: reason={}", e.getClass().getSimpleName());
-                                    servedByFallback.set(true);
-                                    return fallbackFlux(request);
-                                })
-                                .doOnNext(chunk -> {
-                                    if (chunk == null || "[DONE]".equals(chunk.trim())) return;
-                                    String text = extractContent(chunk);
-                                    if (text != null && !text.isEmpty()) {
-                                        contentStarted.set(true);
-                                        responseBuffer.append(text);
-                                    }
-                                })
-                                .doOnComplete(() -> {
-                                    String fullResponse = responseBuffer.toString();
-                                    // Token 结算（多退少补）
-                                    int actualTokens = tokenCountService.countTokens(fullResponse);
-                                    log.debug("Token 结算: userId={}, estimated={}, actual={}", userId, estimatedTokens, actualTokens);
-                                    rateLimiterService.settle(userId, estimatedTokens, actualTokens)
-                                            .subscribe(null, e -> log.error("Token 结算失败: {}", e.getMessage()));
-                                    // 异步写缓存，复用顶部 embedding；fallback 服务的请求跳过（避免低质答案遮蔽主通道）
-                                    if (!servedByFallback.get()) {
-                                        semanticCacheService.saveToCache(embedding.orElse(null), request, fullResponse);
-                                    } else {
-                                        log.debug("fallback 服务，跳过缓存写入");
-                                    }
-                                });
+            // [💎 面试亮点] TTFT-as-failure（Q7 选 A）：
+            //   breaker.decorate 在内、onErrorResume(→fallback) 在外。
+            //   fallback 成功救用户，但不洗白 primary 的 failure 计数——窗口统计才准。
+            //   关掉 slow-call 判定（CircuitBreakerService 里配），TTFT 由上面的 timeout 接管。
+            return primaryWithTtft
+                    .transform(circuitBreakerService.get(route.getModel()))
+                    .onErrorResume(e -> {
+                        if (contentStarted.get()) {
+                            // 首内容已吐，中途错误不能切 fallback（避免半截 A + 半截 B）→ 错误帧
+                            log.warn("主通道中途错误（已吐内容，发错误帧不切 fallback）: {}", e.getMessage());
+                            terminalError.set(true);
+                            return Flux.just(errorFrame("主通道中断: " + safeMsg(e)));
+                        }
+                        // 首内容前失败（TTFT 超时 / breaker open / 早期错误）→ 切 fallback
+                        log.info("主通道失败，切 fallback: reason={}", e.getClass().getSimpleName());
+                        servedByFallback.set(true);
+                        observedChannel.set("fallback");
+                        gatewayMetrics.recordFallbackAttempt(e);
+                        return fallbackFlux(route, request, tracker, terminalError);
+                    })
+                    .doOnNext(chunk -> {
+                        if (chunk == null || "[DONE]".equals(chunk.trim())) {
+                            return;
+                        }
+                        // 与 TTFT 同一谓词：reasoning 也算「已吐内容」，禁止再切 fallback
+                        if (hasContent(chunk)) {
+                            contentStarted.set(true);
+                        }
+                        String text = extractContent(chunk);
+                        if (text != null && !text.isEmpty()) {
+                            responseBuffer.append(text);
+                        }
+                    })
+                    .doOnComplete(() -> {
+                        // 只在正常完成时写缓存；fallback / 错误帧转 complete 都不落库。
+                        if (!servedByFallback.get() && !terminalError.get()) {
+                            semanticCacheService.saveToCache(
+                                    embedding.orElse(null), request, responseBuffer.toString(),
+                                    userId, cacheModel);
+                        } else {
+                            log.debug("跳过缓存写入: fallback={}, terminalError={}",
+                                    servedByFallback.get(), terminalError.get());
+                        }
+                    })
+                    // [💎 面试亮点] doFinally 覆盖 complete / cancel / error。
+                    // LengthGuard 413 在写头之前抛，由 streamChat 外层 doFinally 结算。
+                    // 取消生成不再把预扣挂到 120s EXPIRE；actual = input + 已产出 output。
+                    .doFinally(sig -> {
+                        log.debug("Token 结算信号: signal={}, userId={}", sig, userId);
+                        settleOnce(settlementDone, userId, request,
+                                estimatedTokens, responseBuffer.toString());
+                        tracker.finish(
+                                observedModel.get(),
+                                observedChannel.get(),
+                                outcome(sig, terminalError.get()));
                     });
         });
+    }
+
+    Flux<String> attachSettlement(Flux<String> stream, String userId, ChatRequest request,
+                                  int estimatedTokens, AtomicBoolean settlementDone,
+                                  GatewayMetrics.StreamTracker tracker, String cacheModel) {
+        return Flux.defer(() -> {
+            StringBuilder emittedContent = new StringBuilder();
+            return stream
+                    .doOnNext(chunk -> {
+                        String text = extractContent(chunk);
+                        if (text != null && !text.isEmpty()) {
+                            tracker.firstToken(cacheModel, "cache");
+                            emittedContent.append(text);
+                        }
+                    })
+                    .doFinally(sig -> {
+                        settleOnce(settlementDone, userId, request,
+                                estimatedTokens, emittedContent.toString());
+                        tracker.finish(cacheModel, "cache", outcome(sig, false));
+                    });
+        });
+    }
+
+    private void settleOnce(AtomicBoolean settlementDone, String userId, ChatRequest request,
+                            int estimatedTokens, String outputText) {
+        if (!settlementDone.compareAndSet(false, true)) {
+            return;
+        }
+        int actualTokens = tokenCountService.actualTotalTokens(request, outputText);
+        gatewayMetrics.recordTokenSettlement(estimatedTokens, actualTokens);
+        log.debug("Token 结算: userId={}, estimated={}, actual={}", userId, estimatedTokens, actualTokens);
+        rateLimiterService.settle(userId, estimatedTokens, actualTokens)
+                .subscribe(null, e -> log.error("Token 结算失败: {}", e.getMessage()));
     }
 
     /**
@@ -215,12 +314,22 @@ public class LlmProxyService {
     }
 
     /**
-     * Fallback 通道（Q8）：Ollama OpenAI 兼容端点 qwen3:1.7b。
-     * 不包 breaker（最后手段）；自带 TTFT 超时（复用非思考 SLO）；双重失败 → SSE 错误帧。
+     * 差异化 fallback 通道。不包 breaker（最后手段）；若目标与本次主通道完全相同则拒绝伪 fallback。
      */
-    private Flux<String> fallbackFlux(ChatRequest request) {
+    Flux<String> fallbackFlux(Route primaryRoute, ChatRequest request,
+                              GatewayMetrics.StreamTracker tracker,
+                              AtomicBoolean terminalError) {
         GatewayProperties.FallbackConfig fb = props.getFallback();
-        request.setModel(fb.getRequestModel() != null ? fb.getRequestModel() : fb.getModel());
+        String fallbackModel = fb.getRequestModel() != null ? fb.getRequestModel() : fb.getModel();
+        if (sameEndpoint(primaryRoute.getTargetUrl(), fb.getTargetUrl())) {
+            terminalError.set(true);
+            gatewayMetrics.recordFallbackResult("misconfigured");
+            log.error("拒绝 fallback：主通道与备用通道目标完全相同: target={}, model={}",
+                    fb.getTargetUrl(), fallbackModel);
+            return Flux.just(errorFrame("fallback 配置与主通道相同，已拒绝重复调用"));
+        }
+
+        request.setModel(fallbackModel);
         long slo = props.getTtftSloMs();
         return webClient.post()
                 .uri(fb.getTargetUrl() + "/v1/chat/completions")
@@ -230,12 +339,21 @@ public class LlmProxyService {
                 .bodyValue(request)
                 .retrieve()
                 .bodyToFlux(String.class)
+                .doOnNext(chunk -> {
+                    if (hasContent(chunk)) {
+                        tracker.firstToken(primaryRoute.getModel(), "fallback");
+                    }
+                })
                 .timeout(Mono.delay(Duration.ofMillis(slo)),
                         chunk -> hasContent(chunk) ? Mono.<Long>never() : Mono.delay(Duration.ofMillis(slo)))
+                .doOnComplete(() -> gatewayMetrics.recordFallbackResult("success"))
+                .doOnCancel(() -> gatewayMetrics.recordFallbackResult("cancelled"))
                 // 双重失败 → 复用 SSE 错误帧契约
                 .onErrorResume(e -> {
+                    terminalError.set(true);
+                    gatewayMetrics.recordFallbackResult("failure");
                     log.warn("fallback 也失败: {}", e.getMessage());
-                    return Flux.just("{\"error\": \"主通道与备用通道均不可用: " + safeMsg(e) + "\"}");
+                    return Flux.just(errorFrame("主通道与备用通道均不可用: " + safeMsg(e)));
                 });
     }
 
@@ -282,9 +400,47 @@ public class LlmProxyService {
         }
     }
 
+    /**
+     * SSE 错误帧：用 ObjectMapper 序列化，避免异常消息里的引号/换行破坏 JSON。
+     */
+    String errorFrame(String message) {
+        String msg = (message == null || message.isBlank()) ? "internal error" : message;
+        try {
+            return objectMapper.writeValueAsString(Map.of("error", msg));
+        } catch (Exception e) {
+            return "{\"error\":\"internal error\"}";
+        }
+    }
+
     private String safeMsg(Throwable e) {
         String m = e.getMessage();
         return m == null ? e.getClass().getSimpleName() : m;
+    }
+
+    private String outcome(SignalType signal, boolean terminalError) {
+        if (terminalError || signal == SignalType.ON_ERROR) {
+            return "error";
+        }
+        if (signal == SignalType.CANCEL) {
+            return "cancelled";
+        }
+        return "completed";
+    }
+
+    static boolean sameEndpoint(String primaryUrl, String fallbackUrl) {
+        return normalizeUrl(primaryUrl).equalsIgnoreCase(normalizeUrl(fallbackUrl));
+    }
+
+    private static String normalizeUrl(String value) {
+        String normalized = normalizeValue(value);
+        while (normalized.endsWith("/")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
+    }
+
+    private static String normalizeValue(String value) {
+        return value == null ? "" : value.trim();
     }
 
     private String extractPrompt(ChatRequest request) {

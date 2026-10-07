@@ -86,4 +86,12 @@ public class TokenCountService {
         }
         return encoding.countTokens(text);
     }
+
+    /**
+     * 真实消耗 = input + 已产出 output。预扣是 input + 1.5×input，结算必须两边都含 input，
+     * 否则会把整段 input 当成「多扣」退回，少补永远触发不了。
+     */
+    public int actualTotalTokens(ChatRequest request, String outputText) {
+        return countInputTokens(request) + countTokens(outputText);
+    }
 }

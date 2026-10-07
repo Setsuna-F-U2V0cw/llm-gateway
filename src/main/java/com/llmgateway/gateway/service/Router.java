@@ -16,15 +16,10 @@ import java.util.Map;
 /**
  * 策略模式路由器（阶段四）
  *
- * 缓存未命中时介入，按「意图 + token 长度」决定打哪个下游 model。
+ * 缓存未命中时介入。客户端显式传入已注册 model 则跳过意图分类；否则按意图 + 长度路由。
+ * 两条路径都走 LengthGuard。
  *
- * 组合方式（Q12 选 C）：intent 主导查路由表 → LengthGuard 守卫/覆盖。
- *  - IntentClassifier 产出 intent（embedding 复用，可换规则实现）→ 查 routing 表得 modelId
- *  - LengthGuard：超所选 model 的 maxContext 时，按 xlongThreshold 覆盖到 big-context model，或直接 413 拒
- *
- * 输出 Route 对象（Q10 选 10b）：封装 targetUrl / model / apiKey / isThinking / maxContext。
- *
- * [💎 面试亮点] 两个路由维度全部零额外计算——意图复用缓存检索的 embedding，token 长度复用限流的 JTokkit 计数。
+ * [💎 面试亮点] 意图复用缓存检索的 embedding，token 长度复用限流的 JTokkit 计数；下拉选中的 model 与自动路由互不打架。
  */
 @Slf4j
 @Service
@@ -35,22 +30,28 @@ public class Router {
     private final GatewayProperties props;
 
     /**
-     * 路由决策
+     * 路由决策。
+     * <ul>
+     *   <li>客户端 {@code model} 命中注册表（config key 或 requestModel）→ 显式选用，跳过意图分类</li>
+     *   <li>{@code model} 为空 / {@code auto} / 未注册 → 意图分类 + 路由表</li>
+     *   <li>两种路径都走 LengthGuard</li>
+     * </ul>
      *
-     * @param request    原始请求
-     * @param tokenCount 已算好的 input token 数（复用限流阶段的 JTokkit 结果）
-     * @param embedding  prompt 向量（复用缓存检索阶段；为 null 时走规则分类）
-     * @return Mono<Route> 目标下游全部信息；超上下文上限时 emit 413 错误
+     * @param tokenCount 本次 prompt 的 <strong>input</strong> token（LengthGuard / xlong），
+     *                   不是 TPM 预估总量 {@code input + 1.5×input}
      */
     public Mono<Route> route(ChatRequest request, int tokenCount, float[] embedding) {
         String prompt = extractPrompt(request);
-
-        Intent intent = (embedding != null)
-                ? intentClassifier.classify(embedding)
-                : intentClassifier.classifyByRules(prompt);
-
-        String modelId = resolveModelId(intent);
-        log.info("路由决策: intent={}, model={}, tokenCount={}", intent, modelId, tokenCount);
+        String explicitId = resolveExplicitModelId(request.getModel());
+        String modelId;
+        if (explicitId != null) {
+            modelId = explicitId;
+            log.info("路由决策: explicitModel={}, tokenCount={}", modelId, tokenCount);
+        } else {
+            Intent intent = intentClassifier.classify(embedding, prompt);
+            modelId = resolveModelId(intent);
+            log.info("路由决策: intent={}, model={}, tokenCount={}", intent, modelId, tokenCount);
+        }
 
         // LengthGuard：超所选 model 的上下文上限
         GatewayProperties.ModelConfig chosen = props.getModels().get(modelId);
@@ -88,6 +89,29 @@ public class Router {
                 chosen.getMaxContext(),
                 chosen.getRequestModel()
         ));
+    }
+
+    /**
+     * 客户端显式选了已注册 model 则返回 config key；auto / 空 / 未注册返回 null（走意图）。
+     */
+    String resolveExplicitModelId(String requested) {
+        if (requested == null || requested.isBlank() || "auto".equalsIgnoreCase(requested)) {
+            return null;
+        }
+        Map<String, GatewayProperties.ModelConfig> models = props.getModels();
+        if (models == null || models.isEmpty()) {
+            return null;
+        }
+        if (models.containsKey(requested)) {
+            return requested;
+        }
+        for (Map.Entry<String, GatewayProperties.ModelConfig> e : models.entrySet()) {
+            String tag = e.getValue().getRequestModel();
+            if (tag != null && tag.equals(requested)) {
+                return e.getKey();
+            }
+        }
+        return null;
     }
 
     /** 查路由表，intent 名小写作 key；未命中走 default；default 也缺则取注册表第一个 */

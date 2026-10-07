@@ -1,7 +1,12 @@
 package com.llmgateway.gateway.controller;
 
 import com.llmgateway.gateway.model.ChatRequest;
+import com.llmgateway.gateway.model.DependencyHealth;
+import com.llmgateway.gateway.model.ModelListResponse;
+import com.llmgateway.gateway.service.HealthService;
 import com.llmgateway.gateway.service.LlmProxyService;
+import com.llmgateway.gateway.service.ModelCatalogService;
+import com.llmgateway.gateway.security.GatewayAuthenticationFilter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.MediaType;
@@ -23,6 +28,8 @@ import reactor.core.publisher.Mono;
 public class ChatCompletionController {
 
     private final LlmProxyService llmProxyService;
+    private final HealthService healthService;
+    private final ModelCatalogService modelCatalogService;
 
     /**
      * SSE 流式聊天接口（核心端点）
@@ -37,7 +44,7 @@ public class ChatCompletionController {
      * 完全接收后再返回，大模型长输出在网关层积压，破坏流式体验且极易 OOM。
      *
      * @param request 标准 OpenAI ChatCompletion 请求体
-     * @param userId  多租户隔离用，从 X-User-Id 头读取，默认 anonymous
+     * @param userId  由入口 API Key 映射出的可信 tenantId
      * @return        ResponseEntity 包装的 SSE 流；X-Cache-Hit 头标识是否命中语义缓存，
      *                每条消息格式为 "data: {json}\n\n"，结束时发送 "data: [DONE]\n\n"
      */
@@ -47,16 +54,33 @@ public class ChatCompletionController {
     )
     public Mono<ResponseEntity<Flux<String>>> chatCompletions(
             @RequestBody ChatRequest request,
-            @RequestHeader(value = "X-User-Id", defaultValue = "anonymous") String userId) {
+            @RequestAttribute(GatewayAuthenticationFilter.TENANT_ATTRIBUTE) String userId) {
         log.info("收到聊天请求: userId={}, model={}", userId, request.getModel());
         return llmProxyService.streamChat(request, userId);
     }
 
     /**
-     * 健康检查端点
+     * 进程存活探针。不探测 Redis/Qdrant/Ollama——三件套挂了网关仍 fail-open 接请求。
+     * 依赖分项见 {@link #healthDeps()}。
      */
     @GetMapping("/health")
     public String health() {
         return "LLM Gateway is running";
+    }
+
+    /**
+     * 依赖诊断：并行 ping Redis / Qdrant / Ollama。始终 HTTP 200，body.status 为 up 或 degraded。
+     */
+    @GetMapping("/health/deps")
+    public Mono<DependencyHealth> healthDeps() {
+        return healthService.checkDependencies();
+    }
+
+    /**
+     * OpenAI 兼容模型列表。id 为配置 key（可直接作为 chat 请求的 model）；不含密钥。
+     */
+    @GetMapping("/models")
+    public ModelListResponse models() {
+        return modelCatalogService.list();
     }
 }

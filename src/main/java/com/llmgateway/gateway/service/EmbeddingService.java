@@ -12,7 +12,7 @@ import java.util.List;
 /**
  * Embedding 服务：将文本转换为高维向量，供 Qdrant 语义缓存检索。
  *
- * 实现方式：调用本地 Ollama 的 {@code POST /api/embed} 接口（模型 bge-large-zh-v1.5，1024 维）。
+ * 实现方式：调用本地 Ollama 的 {@code POST /api/embed} 接口（模型 {@code bge-m3}，1024 维）。
  *
  * [💎 面试亮点] 接口设计为 {@code Mono<float[]>}——从 Mock 随机向量替换为真实 HTTP 调用时，
  * 调用方（SemanticCacheService）的响应式链路完全不需要改动，体现了响应式编程的接口稳定性。
@@ -53,8 +53,8 @@ public class EmbeddingService {
                 .map(resp -> toFloatArray(resp.embeddings().get(0)))
                 .map(this::l2Normalize)
                 .doOnNext(vec -> log.debug("Embedding 生成: textLen={}, dim={}", text.length(), vec.length))
-                // 只记日志后向上抛错：SemanticCacheService.tryGetFromCache 外层已有
-                // onErrorResume → Optional.empty() 做 fail-open（降级为未命中透传），
+                // 只记日志后向上抛错：LlmProxyService.embedForPipeline 外层
+                // onErrorResume → Optional.empty() 做 fail-open（降级为规则分类 + 透传），
                 // 本层不吞错，保持错误链可观测。
                 .onErrorResume(e -> {
                     log.warn("Ollama Embedding 调用失败，缓存将降级为未命中透传: {}", e.getMessage());
